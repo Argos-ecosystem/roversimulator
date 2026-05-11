@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Rover Navigator — LLM Pathfinding</title>
+<style>
+  *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #080c18; color: #c8d8c0;
+    font-family: 'Courier New', monospace;
+    padding: 18px; min-height: 100vh;
+  }
+  h1 {
+    font-size: 18px; color: #00ff88;
+    letter-spacing: 4px; text-transform: uppercase;
+    margin-bottom: 14px; text-shadow: 0 0 18px #00ff8855;
+  }
+
+  .layout { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+
+  /* ─── GRID ─────────────────────────────── */
+  #grid-wrap {
+    background: #0b0f1c; padding: 6px;
+    border: 1px solid #1a3a2a; border-radius: 6px;
+    user-select: none;
+  }
+  #grid { display: grid; gap: 2px; }
+  .cell {
+    display: flex; align-items: center; justify-content: center;
+    font-weight: bold; border-radius: 2px;
+    transition: background 0.1s;
+  }
+  .c-unk   { background: #10141f; color: #1e2e1e; }
+  .c-clr   { background: #0a1f12; color: #2a5535; }
+  .c-wall  { background: #3a1010; color: #cc3333; }
+  .c-wall.stale { opacity: 0.32; filter: saturate(0.5); }
+  .c-rover { background: #102040; color: #44aaff; border: 2px solid #44aaff; }
+  .c-tgt   { background: #2a1e04; color: #ffcc00; border: 2px solid #ffcc00; }
+  .c-sens  { outline: 1px solid #00ff8818; outline-offset: -1px; }
+  .c-trail { background: #0a1e10; color: #1a6633; }
+  .c-fail  { background: #200a0a; color: #663322; }
+  .c-plan  {
+    background: #0a2840; color: #66bbff;
+    box-shadow: inset 0 0 8px #4488ff66;
+    animation: plan-in 0.45s ease-out;
+  }
+  .c-plan.through-unk {
+    background: #0a1f30; color: #4488cc;
+    outline: 1px dashed #4488ff55;
+    outline-offset: -2px;
+  }
+  @keyframes plan-in {
+    0%   { background: #4488ff99; transform: scale(0.65); box-shadow: 0 0 12px #4488ffaa; }
+    100% { background: #0a2840; transform: scale(1); }
+  }
+
+  /* setup mode interactions */
+  .edit-mode.draw-walls .cell:not(.c-rover):not(.c-tgt):hover { background: #1a3a20; cursor: pointer; }
+  .edit-mode.draw-walls .cell.c-wall:hover { background: #5a2020; }
+  .edit-mode.place-rover .cell:not(.c-tgt):hover { background: #1a3050; cursor: crosshair; outline: 1px dashed #44aaff; }
+  .edit-mode.place-target .cell:not(.c-rover):hover { background: #3a2a08; cursor: crosshair; outline: 1px dashed #ffcc00; }
+
+  /* ─── SIDEBAR ──────────────────────────── */
+  .sidebar { width: 300px; flex-shrink: 0; }
+  .panel {
+    background: #0c1020; border: 1px solid #1a2e1a;
+    border-radius: 8px; padding: 12px; margin-bottom: 12px;
+  }
+  .panel h3 {
+    font-size: 10px; letter-spacing: 3px; text-transform: uppercase;
+    color: #44cc88; margin-bottom: 10px;
+    border-bottom: 1px solid #1a2e1a; padding-bottom: 6px;
+  }
+
+  button {
+    display: block; width: 100%;
+    background: #0c1e14; color: #00ff88;
+    border: 1px solid #00ff8866;
+    padding: 8px 13px; border-radius: 4px;
+    cursor: pointer; font-family: inherit; font-size: 12px;
+    margin-bottom: 6px; text-align: left;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  button:hover:not(:disabled) { background: #00ff88; color: #080c18; }
+  button:disabled { opacity: 0.3; cursor: not-allowed; }
+  button.danger { border-color: #ff444466; color: #ff6666; background: #1e0c0c; }
+  button.danger:hover:not(:disabled) { background: #ff4444; color: #fff; }
+  button.running { background: #3a0c0c; color: #ff6666; border-color: #ff4444; }
+  button.active  { background: #0e3a22; color: #00ff99; border-color: #00ff88; }
+  button.compact { padding: 6px 10px; font-size: 11px; }
+
+  .srow { margin: 7px 0; }
+  .srow label { font-size: 11px; color: #889988; display: block; margin-bottom: 3px; }
+  input[type=range] { width: 100%; accent-color: #00ff88; cursor: pointer; }
+
+  .stat-row { display: flex; justify-content: space-between; margin: 4px 0; font-size: 12px; }
+  .val { color: #eee; font-weight: bold; }
+  .val.warn { color: #ffaa44; }
+
+  #reasoning {
+    background: #070a14; border: 1px solid #1a2a3a; border-radius: 4px;
+    padding: 10px; font-size: 11px; color: #88aacc;
+    line-height: 1.6; min-height: 54px;
+  }
+
+  #log { max-height: 480px; overflow-y: auto; font-size: 11px; }
+  .log-line { padding: 3px 0; border-bottom: 1px solid #111820; color: #667766; line-height: 1.4; }
+  .log-line.warn  { color: #ffaa44; }
+  .log-line.ok    { color: #00ff88; }
+  .log-line.move  { color: #88aa99; }
+  .log-line.sense { color: #6699cc; }
+  .log-line.crash { color: #ff6644; }
+  .log-line.plan  { color: #aaee88; }
+  .log-line.bfs   { color: #ddaa44; }
+  .log-line.stuck { color: #ff88cc; }
+  .log-line.ctx pre {
+    margin-top: 4px;
+    padding: 6px 8px;
+    background: #050810;
+    border-left: 2px solid #4a7;
+    border-radius: 3px;
+    font-size: 10px;
+    color: #5a9b8e;
+    line-height: 1.15;
+    white-space: pre;
+    overflow-x: auto;
+    font-family: 'Courier New', monospace;
+  }
+  .log-line.ctx { color: #88bbaa; }
+
+  /* ─── DECISIONS TIMELINE ──────────────── */
+  #decisions { max-height: 280px; overflow-y: auto; font-size: 11px; }
+  .dec {
+    border-left: 3px solid #1a3a2a;
+    padding: 6px 8px; margin-bottom: 6px;
+    background: #0a0f18; border-radius: 0 4px 4px 0;
+    cursor: pointer;
+  }
+  .dec:hover { background: #0e1422; }
+  .dec.llm         { border-left-color: #aaee88; }
+  .dec.bfs         { border-left-color: #ddaa44; }
+  .dec.llm_rescued { border-left-color: #66bbff; }
+  .dec.llm_stuck   { border-left-color: #ff88cc; }
+  .dec-head { display: flex; justify-content: space-between; color: #ccc; font-size: 11px; }
+  .dec-meta { color: #667; font-size: 10px; margin-top: 2px; }
+  .dec-reason { color: #99aabb; margin-top: 4px; font-size: 11px; line-height: 1.4; }
+  .dec-grid {
+    display: none; margin-top: 6px;
+    background: #050810; border-radius: 3px; padding: 8px;
+    font-size: 10px; line-height: 1.1; color: #6a8;
+    white-space: pre; overflow-x: auto;
+  }
+  .dec.open .dec-grid { display: block; }
+
+  .hint { font-size: 11px; color: #556655; margin-top: 6px; line-height: 1.5; }
+
+  #banner {
+    display: none; position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+    background: #0d2d1a; border: 2px solid #00ff88; border-radius: 8px;
+    padding: 13px 28px; font-size: 16px; color: #00ff88; z-index: 100;
+    box-shadow: 0 0 40px #00ff8833;
+  }
+  #toast {
+    display: none; position: fixed; top: 20px; right: 20px;
+    background: #2a0d0d; border: 1px solid #ff4444; border-radius: 6px;
+    padding: 10px 14px; color: #ff8866; font-size: 12px; z-index: 100;
+    max-width: 320px;
+  }
+
+  .mode-badge {
+    display: inline-block; font-size: 10px; letter-spacing: 2px;
+    padding: 2px 8px; border-radius: 3px; margin-bottom: 10px;
+  }
+  .mode-setup   { background: #1a2a3a; color: #6699cc; border: 1px solid #2a4a6a; }
+  .mode-mission { background: #0d2d1a; color: #00ff88; border: 1px solid #1a6a3a; }
+
+  .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 6px 0; }
+  .btn-row button { margin-bottom: 0; }
+</style>
+</head>
+<body>
+
+<h1 style="display:flex;justify-content:space-between;align-items:center;">
+  <span>◈ Rover Navigator — LLM Pathfinding</span>
+  <a href="/logout" style="font-size:10px;color:#667; letter-spacing:2px; text-decoration:none;">[ LOGOUT ]</a>
+</h1>
+
+<div class="layout">
+
+  <div id="grid-wrap"><div id="grid"></div></div>
+
+  <div class="sidebar">
+
+    <div id="mode-badge" class="mode-badge mode-setup">SETUP MODE</div>
+
+    <!-- ─── SETUP PANEL ──────────────────── -->
+    <div id="panel-setup" class="panel">
+      <h3>Grid Configuration</h3>
+
+      <div class="srow">
+        <label>LLM model</label>
+        <select id="model-select" onchange="saveConfig()" style="width:100%;background:#0c1e14;color:#00ff88;border:1px solid #00ff8866;padding:7px;border-radius:4px;font-family:inherit;font-size:12px;">
+          <option value="gpt-4o-mini">gpt-4o-mini</option>
+          <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+          <option value="gpt-5-mini">gpt-5-mini</option>
+        </select>
+      </div>
+
+      <div class="srow">
+        <label>Grid size: <span id="gs-val">15</span> × <span id="gs-val2">15</span></label>
+        <input type="range" id="gs-range" min="8" max="40" value="15" oninput="onGridSizeChange(this.value)">
+      </div>
+      <div class="srow">
+        <label>Fixed obstacles: <span id="fo-val">15</span></label>
+        <input type="range" id="fo-range" min="0" max="60" value="15" oninput="document.getElementById('fo-val').textContent=this.value;saveConfig();">
+      </div>
+      <div class="srow">
+        <label>Hidden obstacles: <span id="ho-val">7</span></label>
+        <input type="range" id="ho-range" min="0" max="30" value="7" oninput="document.getElementById('ho-val').textContent=this.value;saveConfig();">
+      </div>
+      <div class="srow">
+        <label>Forward sensor range: <span id="fr-val">3</span> cells (sides 1, back 2 — fixed)</label>
+        <input type="range" id="fr-range" min="2" max="5" value="3" oninput="document.getElementById('fr-val').textContent=this.value;saveConfig();">
+      </div>
+      <div class="srow">
+        <label>Hidden obstacle movement: <span id="mp-val">50</span>% / step</label>
+        <input type="range" id="mp-range" min="0" max="100" value="50" step="10" oninput="document.getElementById('mp-val').textContent=this.value;saveConfig();">
+      </div>
+
+      <div class="btn-row">
+        <button class="compact" onclick="randomizeObstacles()">⚄  RANDOMIZE</button>
+        <button class="compact danger" onclick="clearObstacles()">✕  CLEAR</button>
+      </div>
+      <div class="btn-row">
+        <button class="compact" onclick="document.getElementById('import-file').click()">📁  IMPORT JSON</button>
+        <input type="file" id="import-file" accept=".json,application/json" style="display:none" onchange="importMission(event)">
+        <label class="compact" style="display:flex;align-items:center;gap:6px;font-size:11px;color:#889988;border:1px solid #1a2e1a;background:#0a0f18;padding:6px 10px;border-radius:4px;cursor:pointer;">
+          <input type="checkbox" id="exact-replay" style="accent-color:#00ff88;cursor:pointer">
+          Exact replay
+        </label>
+      </div>
+      <div class="btn-row">
+        <button id="btn-place-rover" class="compact" onclick="setEditMode('place-rover')">◈  PLACE ROVER</button>
+        <button id="btn-place-target" class="compact" onclick="setEditMode('place-target')">✦  PLACE TARGET</button>
+      </div>
+      <button id="btn-launch" onclick="launchMission()" style="border-color:#00ff88aa;font-weight:bold;padding:11px">▶  LAUNCH MISSION</button>
+
+      <p class="hint">Click cells to toggle walls. Use PLACE ROVER / PLACE TARGET to relocate them.</p>
+    </div>
+
+    <!-- ─── MISSION PANEL ───────────────── -->
+    <div id="panel-mission" class="panel" style="display:none">
+      <h3>Mission Control</h3>
+      <div class="srow">
+        <label>Step speed: <span id="spd-val">280</span> ms</label>
+        <input type="range" id="spd-range" min="60" max="1200" value="280" step="20"
+               oninput="document.getElementById('spd-val').textContent=this.value">
+      </div>
+      <button id="btn-go" onclick="toggleGo()" style="font-weight:bold;font-size:14px;padding:12px">▶  GO</button>
+      <div class="btn-row">
+        <button class="compact" onclick="exportMission()">💾  EXPORT JSON</button>
+        <button class="compact danger" onclick="backToSetup()">↩  SETUP</button>
+      </div>
+    </div>
+
+    <!-- ─── PERFORMANCE ─────────────────── -->
+    <div id="panel-stats" class="panel" style="display:none">
+      <h3>Performance</h3>
+      <div class="stat-row">Model <span id="m-model" class="val">—</span></div>
+      <div class="stat-row">Time <span id="m-elapsed" class="val">—</span></div>
+      <div class="stat-row">Efficiency <span id="m-eff" class="val">—</span></div>
+      <div class="stat-row">Plan completion <span id="m-comp" class="val">—</span></div>
+      <div class="stat-row">LLM calls <span id="m-llm" class="val">—</span></div>
+      <div class="stat-row">Crashes / aborts <span id="m-fail" class="val">—</span></div>
+      <div class="stat-row">Steps / replans <span id="m-steps" class="val">—</span></div>
+      <div class="stat-row">Rover <span id="s-pos" class="val">—</span></div>
+      <div class="stat-row" style="display:none"><span id="s-window">0</span><span id="s-rev">0</span><span id="s-walls">0</span></div>
+    </div>
+
+    <!-- ─── LAST REASONING ──────────────── -->
+    <div id="panel-reason" class="panel" style="display:none">
+      <h3>Latest Decision</h3>
+      <div id="reasoning">—</div>
+    </div>
+
+    <!-- ─── DECISION TIMELINE ───────────── -->
+    <div id="panel-decisions" class="panel" style="display:none">
+      <h3>Decision Timeline — click to see LLM input</h3>
+      <div id="decisions"></div>
+    </div>
+
+    <!-- ─── LOG ─────────────────────────── -->
+    <div id="panel-log" class="panel" style="display:none">
+      <h3>Mission Log</h3>
+      <div id="log"></div>
+    </div>
+
+  </div>
+</div>
+
+<div id="banner"></div>
+<div id="toast"></div>
+
+<script>
+// ════════════════ State ════════════════
+let S = null;
+let editGrid = [];
+let editSize = 15;
+let roverPos = [0, 0];
+let targetPos = [14, 14];
+let editMode = 'draw-walls';     // 'draw-walls' | 'place-rover' | 'place-target'
+let inMission = false;
+let running = false;
+let trail = new Set();
+let failedPath = new Set();
+let openDecisionId = null;
+
+// ════════════════ Init ════════════════
+function initEditGrid(gs) {
+  editSize = gs;
+  editGrid = Array.from({length: gs}, () => new Array(gs).fill(0));
+  if (roverPos[0] >= gs || roverPos[1] >= gs) roverPos = [0, 0];
+  if (targetPos[0] >= gs || targetPos[1] >= gs) targetPos = [gs-1, gs-1];
+  renderSetup();
+}
+
+function onGridSizeChange(v) {
+  document.getElementById('gs-val').textContent = v;
+  document.getElementById('gs-val2').textContent = v;
+  const maxObs = Math.floor(v * v * 0.4);
+  document.getElementById('fo-range').max = maxObs;
+  document.getElementById('ho-range').max = Math.floor(maxObs / 2);
+  initEditGrid(parseInt(v));
+  saveConfig();
+}
+
+function setEditMode(mode) {
+  editMode = (editMode === mode) ? 'draw-walls' : mode;
+  document.getElementById('btn-place-rover').classList.toggle('active', editMode === 'place-rover');
+  document.getElementById('btn-place-target').classList.toggle('active', editMode === 'place-target');
+  renderSetup();
+}
+
+function randomizeObstacles() {
+  const gs = parseInt(document.getElementById('gs-range').value);
+  const count = parseInt(document.getElementById('fo-range').value);
+  editSize = gs;
+  editGrid = Array.from({length: gs}, () => new Array(gs).fill(0));
+  const taken = new Set([`${roverPos[0]},${roverPos[1]}`, `${targetPos[0]},${targetPos[1]}`]);
+  let placed = 0, tries = 0;
+  while (placed < count && tries < 10000) {
+    tries++;
+    const r = Math.floor(Math.random() * gs);
+    const c = Math.floor(Math.random() * gs);
+    const k = `${r},${c}`;
+    if (!taken.has(k)) {
+      editGrid[r][c] = 1; taken.add(k); placed++;
+    }
+  }
+  renderSetup();
+  saveConfig();
+}
+
+function clearObstacles() {
+  initEditGrid(parseInt(document.getElementById('gs-range').value));
+  saveConfig();
+}
+
+function cellClick(r, c) {
+  if (inMission) return;
+  if (editMode === 'place-rover') {
+    if (r === targetPos[0] && c === targetPos[1]) return;
+    roverPos = [r, c];
+    if (editGrid[r][c]) editGrid[r][c] = 0;
+    setEditMode('place-rover');   // toggle off
+    renderSetup();
+    saveConfig();
+    return;
+  }
+  if (editMode === 'place-target') {
+    if (r === roverPos[0] && c === roverPos[1]) return;
+    targetPos = [r, c];
+    if (editGrid[r][c]) editGrid[r][c] = 0;
+    setEditMode('place-target');
+    renderSetup();
+    saveConfig();
+    return;
+  }
+  if ((r === roverPos[0] && c === roverPos[1]) || (r === targetPos[0] && c === targetPos[1])) return;
+  editGrid[r][c] = editGrid[r][c] ? 0 : 1;
+  renderSetup();
+  saveConfig();
+}
+
+// ════════════════ Render ════════════════
+function cellSize(gs) {
+  return Math.max(16, Math.min(36, Math.floor(560 / gs)));
+}
+
+function renderSetup() {
+  const gs = editGrid.length;
+  const sz = cellSize(gs);
+  const el = document.getElementById('grid');
+  const wrap = document.getElementById('grid-wrap');
+  el.style.gridTemplateColumns = `repeat(${gs}, ${sz}px)`;
+  wrap.className = 'edit-mode ' + editMode;
+  const fs = Math.max(9, sz - 14);
+
+  let html = '';
+  for (let r = 0; r < gs; r++) {
+    for (let c = 0; c < gs; c++) {
+      const isRover = r === roverPos[0] && c === roverPos[1];
+      const isTarget = r === targetPos[0] && c === targetPos[1];
+      let cls = 'cell', txt = '';
+      if (isRover)            { cls += ' c-rover'; txt = '◈'; }
+      else if (isTarget)      { cls += ' c-tgt';   txt = '✦'; }
+      else if (editGrid[r][c]){ cls += ' c-wall';  txt = '▪'; }
+      else                    { cls += ' c-clr'; }
+      html += `<div class="${cls}" style="width:${sz}px;height:${sz}px;font-size:${fs}px"
+                    onclick="cellClick(${r},${c})"></div>`;
+    }
+  }
+  el.innerHTML = html;
+}
+
+function renderMission() {
+  if (!S) return;
+  const gs = S.grid_size;
+  const sz = cellSize(gs);
+  const el = document.getElementById('grid');
+  const wrap = document.getElementById('grid-wrap');
+  el.style.gridTemplateColumns = `repeat(${gs}, ${sz}px)`;
+  wrap.className = '';
+  const fs = Math.max(9, sz - 14);
+
+  const revealed = new Set(S.revealed.map(([r,c]) => `${r},${c}`));
+  const walls    = new Set((S.known_walls||[]).map(([r,c]) => `${r},${c}`));
+  const stale    = new Set((S.stale_walls||[]).map(([r,c]) => `${r},${c}`));
+  const [rr, rc] = S.rover;
+  const [tr, tc] = S.target;
+  const heading = S.heading || 'S';
+  const fwdR = S.forward_range || 3;
+  const backR = S.back_range || 2;
+  const sideR = S.side_range || 1;
+
+  const dmap  = {N:[-1,0], S:[1,0], W:[0,-1], E:[0,1]};
+  const arrow = {N:'↑', S:'↓', W:'←', E:'→'};
+  const roverGlyph = {N:'▲', S:'▼', E:'▶', W:'◀'};
+  const TL = {N:'W',W:'S',S:'E',E:'N'};
+  const TR = {N:'E',E:'S',S:'W',W:'N'};
+  const OPP = {N:'S',S:'N',E:'W',W:'E'};
+
+  // Simulate plan: F/B move, L/R rotate in place
+  const planMap = new Map();
+  let pr = rr, pc = rc, ph = heading;
+  for (const cmd of S.plan) {
+    if (cmd === 'L') { ph = TL[ph]; }
+    else if (cmd === 'R') { ph = TR[ph]; }
+    else if (cmd === 'F') {
+      pr += dmap[ph][0]; pc += dmap[ph][1];
+      planMap.set(`${pr},${pc}`, arrow[ph]);
+    } else if (cmd === 'B') {
+      const b = OPP[ph];
+      pr += dmap[b][0]; pc += dmap[b][1];
+      planMap.set(`${pr},${pc}`, arrow[b]);
+    }
+  }
+
+  // Directional sensor zone (cross)
+  const sens = new Set();
+  sens.add(`${rr},${rc}`);
+  const fwd = dmap[heading];
+  const back = [-fwd[0], -fwd[1]];
+  const sides = (heading==='N'||heading==='S') ? [[0,-1],[0,1]] : [[-1,0],[1,0]];
+  function lineCells(vec, n) {
+    for (let i=1; i<=n; i++) {
+      const nr=rr+vec[0]*i, nc=rc+vec[1]*i;
+      if (nr<0||nr>=gs||nc<0||nc>=gs) break;
+      sens.add(`${nr},${nc}`);
+    }
+  }
+  lineCells(fwd, fwdR);
+  lineCells(back, backR);
+  for (const s of sides) lineCells(s, sideR);
+
+  let html = '';
+  for (let r=0; r<gs; r++) {
+    for (let c=0; c<gs; c++) {
+      const k = `${r},${c}`;
+      let cls = 'cell', txt = '';
+      if (r===rr && c===rc)            { cls += ' c-rover'; txt = roverGlyph[heading] || '◈'; }
+      else if (r===tr && c===tc)       { cls += ' c-tgt';   txt = '✦'; }
+      else if (walls.has(k))           { cls += ' c-wall' + (stale.has(k) ? ' stale' : ''); txt = '▪'; }
+      else if (planMap.has(k))         { cls += ' c-plan' + (!revealed.has(k) ? ' through-unk' : ''); txt = planMap.get(k); }
+      else if (!revealed.has(k))       { cls += ' c-unk'; }
+      else if (trail.has(k))           { cls += ' c-trail'; txt = '·'; }
+      else if (failedPath.has(k))      { cls += ' c-fail';  txt = '✕'; }
+      else                             { cls += ' c-clr'; }
+      if ((r!==rr || c!==rc) && sens.has(k)) cls += ' c-sens';
+      html += `<div class="${cls}" style="width:${sz}px;height:${sz}px;font-size:${fs}px">${txt}</div>`;
+    }
+  }
+  el.innerHTML = html;
+}
+
+// ════════════════ Mission flow ════════════════
+async function launchMission() {
+  inMission = true;
+  editMode = 'draw-walls';
+  const gs = editGrid.length;
+  const fr = parseInt(document.getElementById('fr-range').value);
+  const hc = parseInt(document.getElementById('ho-range').value);
+  const mp = parseInt(document.getElementById('mp-range').value) / 100;
+  const model = document.getElementById('model-select').value;
+
+  const data = await api('/api/start', {
+    forward_range: fr, grid_size: gs, hidden_count: hc,
+    move_prob: mp, model,
+    grid: editGrid.map(row => row.slice()),
+    rover: roverPos, target: targetPos,
+  });
+  if (!data) { inMission = false; return; }
+  S = data;
+  trail = new Set([`${roverPos[0]},${roverPos[1]}`]);
+  failedPath = new Set();
+  openDecisionId = null;
+
+  document.getElementById('panel-setup').style.display = 'none';
+  document.getElementById('panel-mission').style.display = '';
+  document.getElementById('panel-stats').style.display = '';
+  document.getElementById('panel-reason').style.display = '';
+  document.getElementById('panel-decisions').style.display = '';
+  document.getElementById('panel-log').style.display = '';
+  document.getElementById('mode-badge').className = 'mode-badge mode-mission';
+  document.getElementById('mode-badge').textContent = 'MISSION ACTIVE';
+  document.getElementById('reasoning').textContent = 'Mission launched. Click GO to begin.';
+
+  renderMission(); updateStats(); updateLog(); updateDecisions();
+}
+
+function backToSetup() {
+  running = false;
+  inMission = false;
+  S = null;
+  document.getElementById('panel-setup').style.display = '';
+  document.getElementById('panel-mission').style.display = 'none';
+  document.getElementById('panel-stats').style.display = 'none';
+  document.getElementById('panel-reason').style.display = 'none';
+  document.getElementById('panel-decisions').style.display = 'none';
+  document.getElementById('panel-log').style.display = 'none';
+  document.getElementById('mode-badge').className = 'mode-badge mode-setup';
+  document.getElementById('mode-badge').textContent = 'SETUP MODE';
+  document.getElementById('btn-go').textContent = '▶  GO';
+  document.getElementById('btn-go').classList.remove('running');
+  trail = new Set(); failedPath = new Set();
+  renderSetup();
+}
+
+async function planRoute() {
+  document.getElementById('reasoning').textContent = '⟳ Thinking…';
+  const data = await api('/api/plan');
+  if (!data || data.error) {
+    document.getElementById('reasoning').textContent = '✗ ' + (data?.error || 'request failed');
+    return false;
+  }
+  S = data;
+  failedPath = new Set();
+  const tag = data.source === 'bfs' ? '⚙ BFS'
+            : data.source === 'llm_stuck' ? '✦ STUCK'
+            : data.source === 'llm_rescued' ? '🛟 LLM+BFS rescue'
+            : '🧠 LLM';
+  document.getElementById('reasoning').textContent = `[${tag}] ${data.reasoning || ''}`;
+  renderMission(); updateStats(); updateLog(); updateDecisions();
+  return true;
+}
+
+function buildPlanCells() {
+  if (!S || !S.plan.length) return new Set();
+  const out = new Set();
+  const d = {N:[-1,0],S:[1,0],W:[0,-1],E:[0,1]};
+  const TL = {N:'W',W:'S',S:'E',E:'N'};
+  const TR = {N:'E',E:'S',S:'W',W:'N'};
+  const OPP = {N:'S',S:'N',E:'W',W:'E'};
+  let pr = S.rover[0], pc = S.rover[1], ph = S.heading || 'S';
+  for (const cmd of S.plan) {
+    if (cmd === 'L') ph = TL[ph];
+    else if (cmd === 'R') ph = TR[ph];
+    else if (cmd === 'F') { pr += d[ph][0]; pc += d[ph][1]; out.add(`${pr},${pc}`); }
+    else if (cmd === 'B') { const b = OPP[ph]; pr += d[b][0]; pc += d[b][1]; out.add(`${pr},${pc}`); }
+  }
+  return out;
+}
+
+async function execStep() {
+  const prePlan = buildPlanCells();
+  const data = await api('/api/step');
+  if (!data || data.error) return data?.error || 'fail';
+  S = data;
+  if (data.event === 'moved') trail.add(`${S.rover[0]},${S.rover[1]}`);
+  if (data.event === 'replan') failedPath = prePlan;
+  renderMission(); updateStats(); updateLog(); updateDecisions();
+  return data.event;
+}
+
+async function toggleGo() {
+  const btn = document.getElementById('btn-go');
+  if (running) {
+    running = false;
+    btn.textContent = '▶  RESUME';
+    btn.classList.remove('running');
+    return;
+  }
+  running = true;
+  btn.textContent = '⏸  PAUSE';
+  btn.classList.add('running');
+  await autoLoop();
+}
+
+async function autoLoop() {
+  const btn = document.getElementById('btn-go');
+  while (running) {
+    if (!S || S.done) { running = false; break; }
+    if (S.plan.length === 0) {
+      const ok = await planRoute();
+      if (!ok) { running = false; btn.textContent='▶  GO'; btn.classList.remove('running'); break; }
+      if (!running) break;
+      await sleep(150);
+      continue;
+    }
+    const ev = await execStep();
+    if (ev === 'done') {
+      running = false;
+      banner('🎯 TARGET REACHED');
+      btn.textContent = '▶  GO'; btn.classList.remove('running');
+      break;
+    }
+    if (ev === 'replan') {
+      document.getElementById('reasoning').textContent = '⟳ Route failed — recalculating…';
+      await sleep(300);
+      await planRoute();
+      await sleep(150);
+      continue;
+    }
+    await sleep(parseInt(document.getElementById('spd-range').value));
+  }
+}
+
+// ════════════════ Helpers ════════════════
+async function api(url, body=null) {
+  try {
+    const opts = body
+      ? { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }
+      : { method: 'POST' };
+    const r = await fetch(url, opts);
+    if (r.status === 401) {
+      window.location.href = '/login';
+      return null;
+    }
+    if (!r.ok) {
+      const text = await r.text();
+      toast(`Server ${r.status}: ${text.slice(0,160)}`);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    toast('Network error: ' + e.message);
+    return null;
+  }
+}
+
+async function importMission(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const cfg = data.config || {};
+    const ep  = data.endpoints || {};
+    const exact = document.getElementById('exact-replay').checked;
+
+    const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); };
+
+    if (cfg.grid_size) set('gs-range', cfg.grid_size);
+    if (cfg.forward_range) set('fr-range', cfg.forward_range);
+    if (cfg.move_prob !== undefined) set('mp-range', Math.round(cfg.move_prob * 100));
+    if (data.meta?.model) document.getElementById('model-select').value = data.meta.model;
+
+    const gs = cfg.grid_size || editGrid.length;
+    if (ep.start_pos) roverPos = ep.start_pos;
+    if (ep.target)    targetPos = ep.target;
+
+    // Build editGrid from initial_grid if present
+    if (data.initial_grid && data.initial_grid.length === gs) {
+      if (exact) {
+        // Keep both fixed (1) and hidden (2) for exact replay
+        editGrid = data.initial_grid.map(row => row.slice());
+      } else {
+        // Only fixed walls; hidden will be re-randomized at launch
+        editGrid = data.initial_grid.map(row => row.map(v => v === 1 ? 1 : 0));
+      }
+      editSize = gs;
+    }
+
+    renderSetup();
+    saveConfig();
+    toast(`✓ Imported "${file.name}" — ${exact ? 'exact replay' : 'fresh hidden'}`);
+  } catch (e) {
+    toast('Import failed: ' + e.message);
+  }
+  event.target.value = '';
+}
+
+async function exportMission() {
+  try {
+    const r = await fetch('/api/export');
+    const data = await r.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `mission_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    toast('Export failed: ' + e.message);
+  }
+}
+
+function updateStats() {
+  if (!S) return;
+  const m = S.metrics || {};
+  const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+
+  set('m-model',   S.model || '—');
+  set('m-elapsed', `${m.elapsed_s ?? 0}s`);
+  set('m-eff',     m.path_efficiency != null ? m.path_efficiency.toFixed(2) : '—');
+  set('m-dist',    `${m.manhattan_remaining ?? '—'} / ${m.manhattan_initial ?? '—'}`);
+  set('m-comp',    m.plan_completion_avg != null ? Math.round(m.plan_completion_avg * 100) + '%' : '—');
+  set('m-llm',     `${m.llm_calls || 0} (${m.llm_avg_ms || 0}ms avg, last ${m.llm_last_ms || 0}ms)`);
+  set('m-bfs',     `${m.bfs_calls || 0} / ${m.stuck_calls || 0}`);
+  set('m-fail',    `${m.crashes || 0} / ${m.aborts || 0}`);
+  set('m-move',    `${m.rotations || 0} / ${m.forwards || 0} / ${m.backwards || 0}`);
+  set('m-steps',   `${S.steps} · ${S.recalculations} (${S.plan.length} pend.)`);
+
+  const w = S.replans_window || 0;
+  const wEl = document.getElementById('s-window');
+  wEl.textContent = w;
+  wEl.classList.toggle('warn', w >= 2);
+  set('s-rev',   S.revealed.length);
+  set('s-walls', (S.known_walls || []).length);
+  set('s-pos',   `(${S.rover[0]},${S.rover[1]}) ${S.heading || ''}`);
+}
+
+function updateLog() {
+  if (!S) return;
+  document.getElementById('log').innerHTML = [...S.log].reverse().map(line => {
+    // Multi-line: first line is the header, rest is the ASCII context block
+    if (line.startsWith('📋') && line.includes('\n')) {
+      const [head, ...rest] = line.split('\n');
+      return `<div class="log-line ctx">${escapeHtml(head)}<pre>${escapeHtml(rest.join('\n'))}</pre></div>`;
+    }
+    let cls = 'log-line';
+    if (line.startsWith('→'))       cls += ' move';
+    else if (line.startsWith('↻'))  cls += ' move';
+    else if (line.startsWith('📡')) cls += ' sense';
+    else if (line.startsWith('💨')) cls += ' sense';
+    else if (line.startsWith('💥')) cls += ' crash';
+    else if (line.startsWith('🛑')) cls += ' crash';
+    else if (line.startsWith('🧠')) cls += ' plan';
+    else if (line.startsWith('⚙'))  cls += ' bfs';
+    else if (line.startsWith('✦'))  cls += ' stuck';
+    else if (line.includes('⚠'))   cls += ' warn';
+    else if (line.includes('✓'))   cls += ' ok';
+    return `<div class="${cls}">${escapeHtml(line)}</div>`;
+  }).join('');
+}
+
+function updateDecisions() {
+  if (!S || !S.decisions) return;
+  const list = [...S.decisions].reverse();
+  document.getElementById('decisions').innerHTML = list.map(d => {
+    const icon = d.source === 'bfs' ? '⚙' : (d.source === 'llm_stuck' ? '✦' : '🧠');
+    const label = d.source === 'bfs' ? 'BFS' : (d.source === 'llm_stuck' ? 'STUCK' : 'LLM');
+    const preview = d.plan.slice(0, 10).join(' ') + (d.plan.length > 10 ? '…' : '');
+    const isOpen = openDecisionId === d.id ? ' open' : '';
+    return `<div class="dec ${d.source}${isOpen}" onclick="toggleDecision(${d.id})">
+      <div class="dec-head"><span>${icon} ${label} #${d.id}</span><span>step ${d.step} · ${d.plan.length} moves</span></div>
+      <div class="dec-meta">from (${d.rover[0]},${d.rover[1]}) — plan: ${preview}</div>
+      <div class="dec-reason">${escapeHtml(d.reasoning)}</div>
+      <div class="dec-grid">${escapeHtml(d.ascii_grid || '(no grid)')}</div>
+    </div>`;
+  }).join('');
+}
+
+function toggleDecision(id) {
+  openDecisionId = openDecisionId === id ? null : id;
+  updateDecisions();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+function banner(msg) {
+  const b = document.getElementById('banner');
+  b.textContent = msg; b.style.display = 'block';
+  setTimeout(() => b.style.display='none', 4000);
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  setTimeout(() => t.style.display='none', 5000);
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ════════════════ localStorage persistence ════════════════
+const CONFIG_KEY = 'rover_nav_config_v2';
+
+function saveConfig() {
+  if (inMission) return;
+  try {
+    localStorage.setItem(CONFIG_KEY, JSON.stringify({
+      gs: parseInt(document.getElementById('gs-range').value),
+      fo: parseInt(document.getElementById('fo-range').value),
+      ho: parseInt(document.getElementById('ho-range').value),
+      fr: parseInt(document.getElementById('fr-range').value),
+      mp: parseInt(document.getElementById('mp-range').value),
+      model: document.getElementById('model-select').value,
+      rover: roverPos, target: targetPos,
+      grid: editGrid,
+    }));
+  } catch(_) {}
+}
+
+function loadConfig() {
+  try {
+    const raw = localStorage.getItem(CONFIG_KEY);
+    if (!raw) return false;
+    const c = JSON.parse(raw);
+    const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); };
+    if (c.gs) { set('gs-range', c.gs); }
+    if (c.fo !== undefined) set('fo-range', c.fo);
+    if (c.ho !== undefined) set('ho-range', c.ho);
+    if (c.fr !== undefined) set('fr-range', c.fr);
+    if (c.mp !== undefined) set('mp-range', c.mp);
+    if (c.model) {
+      const sel = document.getElementById('model-select');
+      const ok = Array.from(sel.options).some(o => o.value === c.model);
+      sel.value = ok ? c.model : 'gpt-4o-mini';
+    }
+    if (c.rover && c.target && c.grid && c.grid.length === c.gs) {
+      roverPos = c.rover; targetPos = c.target;
+      editGrid = c.grid; editSize = c.gs;
+      renderSetup();
+    }
+    return true;
+  } catch(_) { return false; }
+}
+
+// ════════════════ Boot ════════════════
+if (!loadConfig()) {
+  initEditGrid(15);
+  randomizeObstacles();
+}
+</script>
+</body>
+</html>

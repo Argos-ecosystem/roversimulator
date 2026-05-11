@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets — NEVER commit
+.env
+.env.*
+*.key
+*.pem
+
+# Build / packaging
+*.zip
+build/
+dist/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+/tmp/rover.log
