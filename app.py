@@ -9,12 +9,67 @@ import json
 import os
 import time
 import secrets
+from pathlib import Path
+
+
+# ─── Auto-load .env if present (no python-dotenv dependency) ──────────────
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("ROVER_SECRET", secrets.token_hex(16))
-client = OpenAI(timeout=15.0)
 MODEL = os.environ.get("ROVER_MODEL", "gpt-4o-mini")
 PASSWORD = os.environ.get("ROVER_PASSWORD")  # if unset → auth disabled
+ENV_FILE = Path(__file__).parent / ".env"
+
+
+def get_client(model_name):
+    """Return an OpenAI-compatible client for the given model.
+    Gemini models use Google's OpenAI-compatible endpoint."""
+    if model_name.startswith("gemini"):
+        key = os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY not set. Configure it in Settings (⚙).")
+        return OpenAI(
+            api_key=key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            timeout=15.0,
+        )
+    # OpenAI default
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY not set. Configure it in Settings (⚙).")
+    return OpenAI(timeout=15.0)
+
+
+def update_env_file(updates):
+    """Update or insert keys in .env file. Also updates os.environ at runtime."""
+    existing = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            existing[k.strip()] = v.strip()
+    for k, v in updates.items():
+        if v is None or v == "":
+            existing.pop(k, None)
+            os.environ.pop(k, None)
+        else:
+            existing[k] = v
+            os.environ[k] = v
+    content = "\n".join(f"{k}={v}" for k, v in existing.items()) + "\n"
+    ENV_FILE.write_text(content)
+    try:
+        os.chmod(ENV_FILE, 0o600)
+    except Exception:
+        pass
 
 
 def login_required(f):
@@ -57,6 +112,9 @@ LOGIN_HTML = """<!DOCTYPE html>
 
 # Cell types in the real grid
 EMPTY, FIXED, HIDDEN = 0, 1, 2
+
+# Discoverable landmarks (letters that the rover learns about by scanning)
+LANDMARK_LABELS = list("DEFGHIJKLM")  # 10 letters, won't collide with A/B/C markers
 DIRS = {"N": (-1, 0), "S": (1, 0), "W": (0, -1), "E": (0, 1)}
 
 # Relative rover commands
@@ -163,9 +221,24 @@ game = {}
 
 # ─── World / state init ───────────────────────────────────────────────────
 def init_game(forward_range, grid_size, hidden_count, move_prob,
-              move_prob_fixed=0.0, manual_grid=None, rover=None, target=None, model=None):
+              move_prob_fixed=0.0, manual_grid=None, rover=None, target=None,
+              targets=None, model=None, mission=None, plan_iterations=1):
     rover = list(rover) if rover else [0, 0]
-    target = list(target) if target else [grid_size - 1, grid_size - 1]
+
+    # Normalize targets: prefer multi-target list, fallback to single target
+    if targets:
+        target_list = []
+        for t in targets:
+            if isinstance(t, dict):
+                target_list.append({"label": t.get("label", "?"), "pos": list(t["pos"]), "visited": False})
+            else:
+                target_list.append({"label": "A", "pos": list(t), "visited": False})
+    else:
+        legacy = list(target) if target else [grid_size - 1, grid_size - 1]
+        target_list = [{"label": "A", "pos": legacy, "visited": False}]
+
+    # Primary target (for BFS rescue + back-compat): first unvisited
+    primary_target = target_list[0]["pos"]
 
     if manual_grid:
         grid = [row[:] for row in manual_grid]
@@ -182,9 +255,10 @@ def init_game(forward_range, grid_size, hidden_count, move_prob,
                 placed.add((r, c))
                 has_hidden_already = True
     placed.add(tuple(rover))
-    placed.add(tuple(target))
+    for t in target_list:
+        placed.add(tuple(t["pos"]))
+        grid[t["pos"][0]][t["pos"][1]] = EMPTY
     grid[rover[0]][rover[1]] = EMPTY
-    grid[target[0]][target[1]] = EMPTY
 
     # Only randomize hidden if the imported grid doesn't already include them
     if not has_hidden_already:
@@ -196,11 +270,23 @@ def init_game(forward_range, grid_size, hidden_count, move_prob,
                     placed.add((r, c))
                     break
 
+    # Place discoverable landmarks (D-M) on empty cells. They don't block movement.
+    landmarks = []
+    for label in LANDMARK_LABELS:
+        for _ in range(300):
+            r = random.randint(0, grid_size - 1)
+            c = random.randint(0, grid_size - 1)
+            if (r, c) not in placed and grid[r][c] == EMPTY:
+                landmarks.append({"label": label, "pos": [r, c], "discovered": False})
+                placed.add((r, c))
+                break
+
     state = {
         "grid": grid,
         "rover": rover,
-        "target": target,
-        "heading": initial_heading(rover, target),
+        "target": primary_target,
+        "targets": target_list,
+        "heading": initial_heading(rover, primary_target),
         "forward_range": forward_range,
         "back_range": BACK_RANGE,
         "side_range": SIDE_RANGE,
@@ -208,6 +294,9 @@ def init_game(forward_range, grid_size, hidden_count, move_prob,
         "move_prob": move_prob,
         "move_prob_fixed": move_prob_fixed,
         "model": model or MODEL,
+        "mission": (mission or "Reach the target efficiently.").strip(),
+        "plan_iterations": max(1, min(int(plan_iterations or 1), 6)),
+        "landmarks": landmarks,
         "revealed": [],
         "known_walls": [],
         "plan": [],
@@ -259,6 +348,13 @@ def reveal_sensor(state, log_events=True):
     state["revealed"] = [list(x) for x in revealed]
     state["known_walls"] = [list(x) for x in known]
 
+    # Discover landmarks within sensor scan
+    new_landmarks = []
+    for lm in state.get("landmarks", []):
+        if not lm["discovered"] and tuple(lm["pos"]) in scan:
+            lm["discovered"] = True
+            new_landmarks.append(lm)
+
     if log_events:
         if new_walls:
             coords = ", ".join(f"({r},{c})" for r, c in new_walls[:4])
@@ -267,6 +363,9 @@ def reveal_sensor(state, log_events=True):
         if cleared:
             coords = ", ".join(f"({r},{c})" for r, c in cleared[:3])
             state["log"].append(f"💨 Memory cleared at {coords} (obstacle moved)")
+        if new_landmarks:
+            txt = ", ".join(f"{lm['label']} at ({lm['pos'][0]},{lm['pos'][1]})" for lm in new_landmarks)
+            state["log"].append(f"🔎 Discovered landmark: {txt}")
 
 
 def move_obstacles(state, prob_hidden, prob_fixed):
@@ -300,6 +399,29 @@ def move_obstacles(state, prob_hidden, prob_fixed):
 
 
 # ─── BFS fallback (uses rover memory only) ────────────────────────────────
+def next_unvisited_target(state):
+    """Pick the closest unvisited target (by Manhattan from rover)."""
+    rover = state["rover"]
+    pending = [t for t in state.get("targets", []) if not t.get("visited")]
+    if not pending:
+        return None
+    return min(pending, key=lambda t: abs(t["pos"][0]-rover[0]) + abs(t["pos"][1]-rover[1]))
+
+
+def update_target_visits(state):
+    """Mark targets visited if rover stands on them. Refresh primary target."""
+    rover_pos = list(state["rover"])
+    newly_visited = []
+    for t in state.get("targets", []):
+        if not t.get("visited") and t["pos"] == rover_pos:
+            t["visited"] = True
+            newly_visited.append(t["label"])
+    nxt = next_unvisited_target(state)
+    if nxt:
+        state["target"] = nxt["pos"]
+    return newly_visited
+
+
 def bfs_path(state):
     gs = state["grid_size"]
     start = tuple(state["rover"])
@@ -362,7 +484,7 @@ def validate_moves(raw):
     return clean, dropped
 
 
-def ask_llm(state, stuck_hint=None, retries=1):
+def ask_llm(state, stuck_hint=None, retries=1, refine_context=None, tactical_phase=None):
     ascii_grid = build_llm_ascii(state)
     rover = state["rover"]
     target = state["target"]
@@ -370,21 +492,91 @@ def ask_llm(state, stuck_hint=None, retries=1):
 
     heading = state.get("heading", "S")
     fwd_r = state.get("forward_range", 3)
-    dr_tgt = target[0] - rover[0]
-    dc_tgt = target[1] - rover[1]
-    manhattan = abs(dr_tgt) + abs(dc_tgt)
+    mission = state.get("mission", "Reach all targets efficiently.")
+    targets = state.get("targets", [])
+
+    marker_lines = []
+    for t in targets:
+        seen = "visited" if t.get("visited") else "not visited yet"
+        marker_lines.append(f"  {t['label']} → (row {t['pos'][0]}, col {t['pos'][1]})  [{seen}]")
+    marker_block = "\n".join(marker_lines) if marker_lines else "  (no markers placed)"
+
+    discovered = [lm for lm in state.get("landmarks", []) if lm.get("discovered")]
+    if discovered:
+        lm_lines = "\n".join(f"  {lm['label']} at (row {lm['pos'][0]}, col {lm['pos'][1]})" for lm in discovered)
+        landmark_block = lm_lines
+    else:
+        landmark_block = "  (none discovered yet — they appear as the rover scans them)"
+
+    # Recent decisions for continuity across plan calls
+    recent = state.get("decisions", [])[-3:]
+    if recent:
+        hist = "\n".join(f"  • step {d['step']} from ({d['rover'][0]},{d['rover'][1]}) [{d['source']}]: {d['reasoning'][:140]}" for d in recent)
+    else:
+        hist = "  (this is the first decision of the mission)"
+
+    notes = state.get("mission_notes", "")
+    phase = state.get("mission_phase", "")
+    current_goal = state.get("current_goal", "")
+    next_goal = state.get("next_goal", "")
+
+    state_block_lines = []
+    if phase:        state_block_lines.append(f"  Phase: {phase}")
+    if current_goal: state_block_lines.append(f"  Current goal: {current_goal}")
+    if next_goal:    state_block_lines.append(f"  Next goal: {next_goal}")
+    if notes:        state_block_lines.append(f"  Free notes: {notes}")
+    mission_state_block = "\n".join(state_block_lines) if state_block_lines else "  (first decision of the mission — define the phase plan and start)"
+
+    # Detect "achievement": current_goal mentions a marker that's now visited.
+    # This catches the common bug where the LLM keeps planning toward the old goal.
+    achievement_hint = ""
+    if current_goal:
+        achieved = []
+        for t in targets:
+            if t.get("visited") and t["label"] in current_goal:
+                achieved.append(t["label"])
+        if achieved:
+            achievement_hint = (
+                f"\n⚡ ACHIEVEMENT JUST UNLOCKED: marker(s) {', '.join(achieved)} are NOW VISITED. "
+                f"Your previous current_goal ('{current_goal}') is COMPLETE. "
+                f"Switch to next_goal ('{next_goal or 'declare done if mission is finished'}') THIS turn."
+            )
+
+    start_pos = state.get("start_pos", rover)
+    at_origin = list(rover) == list(start_pos)
+    at_origin_hint = ""
+    if at_origin and state.get("steps", 0) > 0:
+        at_origin_hint = (
+            "\n⚡ YOU ARE BACK AT ORIGIN (rover position == start position). "
+            "If your mission says to return home / origin / start, this is the moment to set \"done\": true."
+        )
+
     base = f"""You are the navigation AI for an autonomous rover on a {gs}x{gs} grid.
+
+MISSION (operator instruction — HIGHEST PRIORITY, this defines what success means):
+  {mission or "(no mission given — explore at your discretion)"}
+
+LABELED REFERENCE POINTS on the map (you decide what to do with them based on the mission):
+{marker_block}
+
+DISCOVERED LANDMARKS (random letters the rover has scanned and now remembers their position — useful for navigation reference):
+{landmark_block}
 
 CURRENT STATE
   Rover at (row {rover[0]}, col {rover[1]}), facing {heading}.
-  Target at (row {target[0]}, col {target[1]}).
-  Manhattan distance to target: {manhattan} cells (Δrow={dr_tgt:+d}, Δcol={dc_tgt:+d}).
+  Rover STARTED at (row {start_pos[0]}, col {start_pos[1]})  ← this is "origin" / "home" / "start point" if the mission mentions it.
+
+RECENT DECISIONS (your own past plans — use these for continuity across multi-step missions):
+{hist}
+
+MISSION STATE (what YOU declared last call — read this before deciding what to do next):
+{mission_state_block}
 
 GRID (row 0 = top, col 0 = left, N=up S=down E=right W=left):
 {ascii_grid}
 
 Legend:
-  R = rover (facing {heading})        T = target
+  R = rover (facing {heading})        A/B/C = labeled reference points (NOT mandatory destinations — see mission)
   # = known obstacle (impassable)     . = confirmed clear     ? = unscanned
 
 RELATIVE COMMANDS (interpreted from current heading):
@@ -396,24 +588,83 @@ RELATIVE COMMANDS (interpreted from current heading):
 SENSOR (cross-shape, rotates with heading):
   {fwd_r} cells ahead · 2 behind · 1 each side
 
-⚠ CRITICAL REQUIREMENTS:
-  • Your plan MUST end with the rover AT position (row {target[0]}, col {target[1]}).
-  • Do NOT stop early — plan the COMPLETE route to T.
-  • You may use up to {gs * 6} commands. Use as many as needed to reach T.
-  • If your heading points away from T, start with L or R to turn.
-  • Avoid # cells. Prefer . over ? when possible, but cross ? if needed.
+INTERPRETATION RULES:
+  • The MISSION text is your contract. A/B/C are NOT automatic goals — they are just points you can reference if the mission says so.
+  • If the mission says "visit A then B" → visit them.
+  • If the mission says "ignore C" or "stay away from B" → respect that.
+  • If the mission gives a free instruction (patrol, explore, etc.) → use your judgment.
+  • You may use up to {gs * 6} commands per plan. Plan partial routes — you'll be called again as you progress.
+  • Avoid # cells. Prefer . over ? but cross ? if necessary.
+
+MULTI-STEP MISSIONS — STATE MACHINE PROTOCOL:
+  Every call you MUST update these structured fields so the next-you can pick up coherently:
+    - "phase":         e.g. "1/2", "2/3", "single" — which step of the mission you're on
+    - "current_goal":  short description of THIS turn's objective (e.g. "reach A")
+    - "next_goal":     what comes after this is done (e.g. "return to origin (0,0)") — empty if mission ends here
+    - "notes":         free scratchpad (anything else worth remembering)
+  Read the MISSION STATE block above carefully. If phase/current_goal already exist, you are CONTINUING — don't restart planning from scratch.
+  When the FULL mission is complete (all phases done), signal with "done": true.{at_origin_hint}{achievement_hint}
 
 Respond ONLY with valid JSON (no markdown):
-{{"moves": ["F","R","F",...], "reasoning": "brief strategy"}}"""
+{{
+  "moves": ["F","R","F",...],
+  "reasoning": "what you're doing this turn and why",
+  "phase": "1/2",
+  "current_goal": "reach A",
+  "next_goal": "return to origin",
+  "notes": "anything else worth remembering",
+  "done": false
+}}"""
     if stuck_hint:
         base += f"\n\n⚠ HINT (rover seems stuck):\n{stuck_hint}"
+
+    # Tactical mode: focus on a single phase, server handles transitions
+    if tactical_phase:
+        phase = tactical_phase
+        base += f"""
+
+═══ TACTICAL EXECUTION MODE ═══
+You are NOT planning the whole mission. The server already decomposed it into phases and is tracking which one you're on. You only need to plan moves for THIS phase:
+
+  Phase goal: {phase['goal']}
+  End condition: rover must reach position (row {phase['end_when_pos'][0]}, col {phase['end_when_pos'][1]})
+
+Ignore previous mission state — focus purely on getting from your current position to the phase target. The server will auto-advance to the next phase when you arrive.
+
+Set "done": false (server decides when whole mission is done).
+You can leave phase/current_goal/next_goal empty — server tracks those now."""
+
+    # Iterative refinement: feed the model its own previous draft to critique + improve
+    if refine_context:
+        rc = refine_context
+        sim_pos, _ = simulate_plan(rover, heading, rc["prev_plan"])
+        base += f"""
+
+═══ REFINEMENT PASS {rc['pass']}/{rc['total']} ═══
+This is NOT a fresh plan. You already drafted one for THIS SAME turn. Critique and improve it.
+
+Your previous draft:
+  moves: {rc['prev_plan']}
+  reasoning: {rc['prev_reasoning']}
+  → if executed, the rover would end at row {sim_pos[0]}, col {sim_pos[1]}
+
+Critique it honestly:
+  • Does it actually reach this turn's goal? (it ends at {sim_pos})
+  • Does any step cross a # obstacle?
+  • Are there wasteful rotations or back-and-forth moves?
+  • Does it respect the mission?
+
+Output an IMPROVED plan in the same JSON format. If the draft was already optimal, return it unchanged."""
+
+    model_name = state.get("model", MODEL)
+    client = get_client(model_name)
 
     last_err = None
     for attempt in range(retries + 1):
         try:
             t0 = time.time()
             resp = client.chat.completions.create(
-                model=state.get("model", MODEL),
+                model=model_name,
                 max_tokens=800,
                 response_format={"type": "json_object"},
                 timeout=15,
@@ -429,20 +680,176 @@ Respond ONLY with valid JSON (no markdown):
             m["llm_total_ms"] = m.get("llm_total_ms", 0.0) + elapsed_ms
             m["llm_last_ms"] = elapsed_ms
             data = json.loads(resp.choices[0].message.content)
+            done_flag = bool(data.get("done"))
             clean, dropped = validate_moves(data.get("moves", []))
-            if not clean:
+            if not clean and not done_flag:
                 last_err = f"no valid moves in response (got {data.get('moves')!r})"
                 continue
             reasoning = data.get("reasoning", "").strip() or "(no reasoning)"
             if dropped:
                 reasoning += f"  [⚠ dropped invalid: {dropped}]"
-            return {"moves": clean, "reasoning": reasoning, "ascii_grid": ascii_grid}
+            notes = (data.get("notes") or "").strip()
+            phase = (data.get("phase") or "").strip()
+            current_goal = (data.get("current_goal") or "").strip()
+            next_goal = (data.get("next_goal") or "").strip()
+            return {
+                "moves": clean,
+                "reasoning": reasoning,
+                "ascii_grid": ascii_grid,
+                "done": done_flag,
+                "notes": notes,
+                "phase": phase,
+                "current_goal": current_goal,
+                "next_goal": next_goal,
+            }
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             last_err = str(e)
             continue
         except Exception as e:
             raise RuntimeError(f"OpenAI call failed: {e}")
     raise RuntimeError(f"LLM gave unusable response after retries: {last_err}")
+
+
+def ask_llm_strategy(state):
+    """High-level decomposition: ONE call at the start of the mission.
+    Asks the LLM to break the mission into checkpointed phases. The server
+    will then track phase progression deterministically, freeing the LLM
+    from having to remember the full mission across calls."""
+    rover = state["rover"]
+    target = state["target"]
+    targets = state.get("targets", [])
+    gs = state["grid_size"]
+    mission = state.get("mission", "Reach the target.")
+    start_pos = state.get("start_pos", rover)
+
+    marker_lines = [
+        f"  {t['label']} at (row {t['pos'][0]}, col {t['pos'][1]})"
+        for t in targets
+    ]
+    marker_block = "\n".join(marker_lines) if marker_lines else "  (none placed)"
+
+    prompt = f"""You are a strategic mission planner for an autonomous rover. Decompose the
+operator's mission into an ORDERED LIST OF PHASES. Each phase has a goal in plain text
+and an END CONDITION expressed as either a target cell position or a marker label.
+
+The rover will execute phases sequentially. The server detects when a phase's end
+condition is met and auto-advances. Your job is ONLY to define the phases.
+
+MISSION TEXT (operator):
+  {mission}
+
+WORLD INFO:
+  Grid size: {gs}x{gs}
+  Rover start position: (row {start_pos[0]}, col {start_pos[1]})
+  Markers on the map:
+{marker_block}
+
+OUTPUT JSON SCHEMA (no markdown, no commentary):
+{{
+  "phases": [
+    {{"goal": "short description of this phase", "end_when_pos": [row, col]}},
+    {{"goal": "next phase", "end_when_pos": [row, col]}}
+  ]
+}}
+
+RULES:
+  • Use exact coordinates [row, col]. If a phase ends at marker A, use A's coordinates.
+  • If the mission says "return to origin" or "go back home", use the rover's start position.
+  • Order matters — phases run in sequence.
+  • Keep phases atomic: one location per phase.
+  • If the mission has no real phases (single destination), output ONE phase only.
+  • Be literal: respect order ("then", "after that"), exclusions ("ignore B"), and conditions.
+
+Now produce the decomposition for the mission above."""
+
+    model_name = state.get("model", MODEL)
+    client = get_client(model_name)
+
+    t0 = time.time()
+    resp = client.chat.completions.create(
+        model=model_name,
+        max_tokens=600,
+        response_format={"type": "json_object"},
+        timeout=15,
+        messages=[
+            {"role": "system", "content": "You are a strategic mission planner. Output valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    elapsed_ms = (time.time() - t0) * 1000
+    m = state.get("metrics", {})
+    m["llm_calls"] = m.get("llm_calls", 0) + 1
+    m["llm_total_ms"] = m.get("llm_total_ms", 0.0) + elapsed_ms
+    m["llm_last_ms"] = elapsed_ms
+
+    data = json.loads(resp.choices[0].message.content)
+    raw_phases = data.get("phases", [])
+    phases = []
+    for i, p in enumerate(raw_phases):
+        pos = p.get("end_when_pos") or p.get("pos") or p.get("target")
+        if not (isinstance(pos, list) and len(pos) == 2):
+            continue
+        phases.append({
+            "idx": i,
+            "goal": p.get("goal", f"phase {i+1}"),
+            "end_when_pos": [int(pos[0]), int(pos[1])],
+            "done": False,
+        })
+    if not phases:
+        # Fallback: single phase to the primary target
+        phases = [{"idx": 0, "goal": "reach target", "end_when_pos": list(target), "done": False}]
+    return phases
+
+
+def current_phase(state):
+    strat = state.get("strategy") or []
+    idx = state.get("current_phase_idx", 0)
+    if 0 <= idx < len(strat):
+        return strat[idx]
+    return None
+
+
+def check_phase_completion(state):
+    """If the rover is at the end_when_pos of the current phase, mark it done and advance.
+    Returns the label of the completed phase (or None)."""
+    phase = current_phase(state)
+    if not phase:
+        return None
+    if list(state["rover"]) == list(phase["end_when_pos"]):
+        phase["done"] = True
+        state["current_phase_idx"] = state.get("current_phase_idx", 0) + 1
+        return phase
+    return None
+
+
+def iterative_plan(state, iterations, tactical_phase=None):
+    """Turn a normal model into a 'thinking' one: draft a plan, then refine it
+    over N passes. Optionally constrained to a tactical phase."""
+    iterations = max(1, min(int(iterations), 6))
+    result = None
+    history = []
+    for i in range(iterations):
+        if result is None:
+            result = ask_llm(state, tactical_phase=tactical_phase)
+        else:
+            result = ask_llm(state, tactical_phase=tactical_phase, refine_context={
+                "pass": i + 1,
+                "total": iterations,
+                "prev_plan": result["moves"],
+                "prev_reasoning": result["reasoning"],
+            })
+        history.append({
+            "pass": i + 1,
+            "moves": list(result["moves"]),
+            "reasoning": result["reasoning"],
+        })
+        if iterations > 1:
+            tag = "draft" if i == 0 else f"refine {i+1}/{iterations}"
+            state["log"].append(
+                f"🔄 Plan {tag}: {len(result['moves'])} moves — {result['reasoning'][:90]}"
+            )
+    result["refine_history"] = history
+    return result
 
 
 # ─── Decision recorder ────────────────────────────────────────────────────
@@ -517,6 +924,15 @@ def client_state(state):
     return {
         "rover": state["rover"],
         "target": state["target"],
+        "targets": state.get("targets", []),
+        "landmarks": [lm for lm in state.get("landmarks", []) if lm.get("discovered")],
+        "mission_notes": state.get("mission_notes", ""),
+        "plan_iterations": state.get("plan_iterations", 1),
+        "strategy": state.get("strategy", []),
+        "current_phase_idx": state.get("current_phase_idx", 0),
+        "mission_phase": state.get("mission_phase", ""),
+        "current_goal": state.get("current_goal", ""),
+        "next_goal": state.get("next_goal", ""),
         "revealed": state["revealed"],
         "known_walls": state["known_walls"],
         "stale_walls": stale_walls,
@@ -534,6 +950,7 @@ def client_state(state):
         "side_range": state["side_range"],
         "metrics": metrics,
         "model": state.get("model", MODEL),
+        "mission": state.get("mission", ""),
     }
 
 
@@ -554,6 +971,128 @@ def login():
 def logout():
     session.clear()
     return redirect("/login" if PASSWORD else "/")
+
+
+SETTINGS_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Settings — Rover Navigator</title>
+<style>
+  body { background:#080c18; color:#c8d8c0; font-family:'Courier New',monospace;
+         margin:0; padding:30px; min-height:100vh; }
+  .box { max-width:520px; margin:0 auto; background:#0c1020;
+         border:1px solid #1a3a2a; border-radius:10px; padding:28px; }
+  h1 { color:#00ff88; font-size:16px; letter-spacing:3px; margin-bottom:18px;
+       text-transform:uppercase; text-shadow:0 0 18px #00ff8855;
+       display:flex; justify-content:space-between; align-items:center; }
+  h1 a { color:#667; font-size:11px; text-decoration:none; }
+  h3 { font-size:10px; letter-spacing:3px; text-transform:uppercase;
+       color:#44cc88; margin:18px 0 8px; border-bottom:1px solid #1a2e1a; padding-bottom:6px; }
+  label { display:block; font-size:11px; color:#889988; margin:8px 0 4px; }
+  .current { font-size:11px; color:#667; margin-bottom:4px; font-style:italic; }
+  input { width:100%; background:#070a14; color:#c8d8c0; border:1px solid #1a3a2a;
+          padding:9px; border-radius:4px; font-family:inherit; font-size:13px; }
+  input:focus { outline:none; border-color:#00ff88; }
+  button { width:100%; background:#0c1e14; color:#00ff88; border:1px solid #00ff88;
+           padding:10px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:12px;
+           letter-spacing:2px; text-transform:uppercase; margin-top:18px; }
+  button:hover { background:#00ff88; color:#080c18; }
+  .msg { padding:10px; border-radius:4px; margin:10px 0; font-size:12px; display:none; }
+  .msg.ok  { display:block; background:#0d2d1a; border:1px solid #00ff88; color:#00ff88; }
+  .msg.err { display:block; background:#2a0d0d; border:1px solid #ff4444; color:#ff8866; }
+  .note { font-size:10px; color:#556; margin-top:6px; line-height:1.5; }
+</style></head><body>
+<div class="box">
+  <h1>⚙ Settings <a href="/">↩ back to simulator</a></h1>
+
+  <h3>OpenAI</h3>
+  <div class="current">current: {{ openai_masked }}</div>
+  <label>OpenAI API key (gpt-* models)</label>
+  <input id="openai_key" type="password" placeholder="sk-proj-..." autocomplete="off">
+
+  <h3>Google Gemini</h3>
+  <div class="current">current: {{ gemini_masked }}</div>
+  <label>Gemini API key (gemini-* models)</label>
+  <input id="gemini_key" type="password" placeholder="AIza..." autocomplete="off">
+  <div class="note">Get yours at <span style="color:#88aacc">aistudio.google.com/apikey</span></div>
+
+  <h3>Access password</h3>
+  <div class="current">current: {{ password_status }}</div>
+  <label>New password (leave blank to keep current)</label>
+  <input id="new_password" type="password" placeholder="new password" autocomplete="off">
+
+  <div id="msg" class="msg"></div>
+  <button onclick="save()">▶ SAVE</button>
+</div>
+<script>
+async function save() {
+  const body = {
+    openai_key: document.getElementById('openai_key').value.trim(),
+    gemini_key: document.getElementById('gemini_key').value.trim(),
+    new_password: document.getElementById('new_password').value.trim(),
+  };
+  const msg = document.getElementById('msg');
+  msg.className = 'msg'; msg.textContent = '';
+  try {
+    const r = await fetch('/api/settings', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) { msg.className='msg err'; msg.textContent='✗ '+(data.error||r.statusText); return; }
+    msg.className='msg ok'; msg.textContent='✓ Saved. ' + (data.note || '');
+    ['openai_key','gemini_key','new_password'].forEach(id => document.getElementById(id).value='');
+    setTimeout(()=>location.reload(), 1500);
+  } catch(e) {
+    msg.className='msg err'; msg.textContent='✗ '+e.message;
+  }
+}
+</script>
+</body></html>"""
+
+
+def _mask(value):
+    if not value:
+        return "(not set)"
+    if len(value) <= 8:
+        return "***"
+    return value[:4] + "…" + value[-4:]
+
+
+@app.route("/settings", methods=["GET"])
+@login_required
+def settings_page():
+    return render_template_string(
+        SETTINGS_HTML,
+        openai_masked=_mask(os.environ.get("OPENAI_API_KEY")),
+        gemini_masked=_mask(os.environ.get("GEMINI_API_KEY")),
+        password_status="set" if PASSWORD else "(none — auth disabled)",
+    )
+
+
+@app.route("/api/settings", methods=["POST"])
+@login_required
+def api_settings():
+    global PASSWORD
+    data = request.json or {}
+    updates = {}
+    notes = []
+    if data.get("openai_key"):
+        updates["OPENAI_API_KEY"] = data["openai_key"]
+        notes.append("OpenAI key updated.")
+    if data.get("gemini_key"):
+        updates["GEMINI_API_KEY"] = data["gemini_key"]
+        notes.append("Gemini key updated.")
+    if data.get("new_password"):
+        updates["ROVER_PASSWORD"] = data["new_password"]
+        PASSWORD = data["new_password"]
+        notes.append("Password changed.")
+    if not updates:
+        return jsonify({"error": "Nothing to update."}), 400
+    try:
+        update_env_file(updates)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "note": " ".join(notes)})
 
 
 @app.route("/")
@@ -577,6 +1116,9 @@ def start():
         rover=d.get("rover"),
         target=d.get("target"),
         model=d.get("model"),
+        mission=d.get("mission"),
+        plan_iterations=d.get("plan_iterations", 1),
+        targets=d.get("targets"),
     )
     game["log"].append(
         f"🚀 Mission start: {game['grid_size']}×{game['grid_size']}, sensor fwd={game['forward_range']}/back={BACK_RANGE}/side={SIDE_RANGE}, "
@@ -637,24 +1179,66 @@ def plan():
             game["log"].append(f"✗ LLM error: {e}")
             return jsonify({"error": str(e)}), 500
 
-    # --- Normal LLM path ---
+    # --- Generate strategy on first plan call (hierarchical decomposition) ---
+    if not game.get("strategy"):
+        try:
+            strategy = ask_llm_strategy(game)
+            game["strategy"] = strategy
+            game["current_phase_idx"] = 0
+            phase_lines = " → ".join(f"{p['goal']} @{tuple(p['end_when_pos'])}" for p in strategy)
+            game["log"].append(f"🗺 Strategy decomposed: {phase_lines}")
+        except Exception as e:
+            game["log"].append(f"✗ Strategy generation failed: {e} — falling back to single-phase")
+            game["strategy"] = [{"idx": 0, "goal": "reach target", "end_when_pos": list(game["target"]), "done": False}]
+            game["current_phase_idx"] = 0
+
+    # If all phases completed → mission done
+    if game.get("current_phase_idx", 0) >= len(game["strategy"]):
+        game["done"] = True
+        game["log"].append("🏁 All phases complete — mission done.")
+        return jsonify({**client_state(game), "source": "strategy_complete", "reasoning": "All strategic phases finished."})
+
+    phase = current_phase(game)
+
+    # --- Normal LLM path (tactical: only plan for the current phase) ---
     try:
-        r = ask_llm(game)
+        r = iterative_plan(game, game.get("plan_iterations", 1), tactical_phase=phase)
+
+        # Persist the LLM's structured mission state for next call.
+        # Always overwrite (even with empty) so "" means "no longer applicable",
+        # not "keep the stale value".
+        if "notes" in r:        game["mission_notes"]  = r["notes"]
+        if "phase" in r:        game["mission_phase"]  = r["phase"]
+        if "current_goal" in r: game["current_goal"]   = r["current_goal"]
+        if "next_goal" in r:    game["next_goal"]      = r["next_goal"]
+
+        # If the LLM declared mission done, honor it (no movement plan needed)
+        if r.get("done") and not r["moves"]:
+            game["done"] = True
+            game["plan"] = []
+            record_decision(game, "llm_done", [], r["reasoning"], r["ascii_grid"])
+            game["log"].append(f"🏁 LLM declared mission complete — {r['reasoning']}")
+            return jsonify({**client_state(game), "source": "llm_done", "reasoning": r["reasoning"]})
+
+        # BFS rescue points to the CURRENT PHASE target, not the global one
+        phase_goal_pos = tuple(phase["end_when_pos"])
         final_pos, _ = simulate_plan(game["rover"], game["heading"], r["moves"])
-        reaches = final_pos == tuple(game["target"])
+        reaches = final_pos == phase_goal_pos
 
         source = "llm"
         rescue_note = ""
         if not reaches:
-            # LLM gave an incomplete plan — rescue with BFS so the rover always
-            # has a route that actually reaches T (when one exists in memory).
+            # Use BFS pointing to the current phase target
+            saved_target = game["target"]
+            game["target"] = list(phase_goal_pos)
             abs_path = bfs_path(game)
+            game["target"] = saved_target
             if abs_path:
                 rescued = absolute_to_relative(abs_path, game["heading"])
                 source = "llm_rescued"
                 rescue_note = (
-                    f"  ⚠ LLM plan stopped at {final_pos}; BFS extended to full "
-                    f"{len(rescued)}-move route to {tuple(game['target'])}."
+                    f"  ⚠ LLM plan stopped at {final_pos}; BFS extended to phase target {phase_goal_pos} "
+                    f"({len(rescued)} moves)."
                 )
                 game["metrics"]["bfs_calls"] += 1
                 r["moves"] = rescued
@@ -771,12 +1355,24 @@ def step():
     # 7. Scan from new position
     reveal_sensor(game, log_events=True)
 
-    if tuple(game["rover"]) == tuple(game["target"]):
-        game["done"] = True
-        game["log"].append(
-            f"✓ TARGET REACHED — {game['steps']} steps, {game['recalculations']} recalcs"
-        )
-        return jsonify({**client_state(game), "event": "done"})
+    # 8. Track visits to markers
+    newly = update_target_visits(game)
+    for label in newly:
+        game["log"].append(f"🎯 Passed marker {label}")
+
+    # 9. Strategic phase completion check — server auto-advances phases
+    completed = check_phase_completion(game)
+    if completed:
+        game["log"].append(f"✓ Phase {completed['idx']+1} complete: {completed['goal']}")
+        # Force a fresh plan for the new phase
+        game["plan"] = []
+        # Check if mission is done (all phases complete)
+        if game.get("current_phase_idx", 0) >= len(game.get("strategy", [])):
+            game["done"] = True
+            game["log"].append(f"🏁 ALL PHASES COMPLETE — {game['steps']} steps total")
+            return jsonify({**client_state(game), "event": "done"})
+        # Otherwise: signal frontend to request new plan
+        return jsonify({**client_state(game), "event": "phase_complete", "move": cmd})
 
     return jsonify({**client_state(game), "event": "moved", "move": cmd})
 

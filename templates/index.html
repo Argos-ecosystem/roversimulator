@@ -35,7 +35,18 @@
   .c-wall  { background: #3a1010; color: #cc3333; }
   .c-wall.stale { opacity: 0.32; filter: saturate(0.5); }
   .c-rover { background: #102040; color: #44aaff; border: 2px solid #44aaff; }
-  .c-tgt   { background: #2a1e04; color: #ffcc00; border: 2px solid #ffcc00; }
+  .c-tgt        { background: #2a1e04; color: #ffcc00; border: 2px solid #ffcc00; font-weight: bold; }
+  .c-tgt.tgt-A  { background: #2a1e04; color: #ffcc00; border-color: #ffcc00; }
+  .c-tgt.tgt-B  { background: #04222a; color: #44ccff; border-color: #44ccff; }
+  .c-tgt.tgt-C  { background: #2a042a; color: #ff66cc; border-color: #ff66cc; }
+  .c-tgt.visited {
+    background: #0a1a14 !important;
+    color: #66aa44 !important;
+    border-color: #44aa44 !important;
+    opacity: 0.45;
+    text-decoration: line-through;
+  }
+  .c-landmark { background: #1a1e2a; color: #aa88ee; border: 1px dashed #6655aa; font-weight: bold; }
   .c-sens  { outline: 1px solid #00ff8818; outline-offset: -1px; }
   .c-trail { background: #0a1e10; color: #1a6633; }
   .c-fail  { background: #200a0a; color: #663322; }
@@ -182,7 +193,10 @@
 
 <h1 style="display:flex;justify-content:space-between;align-items:center;">
   <span>◈ Rover Navigator — LLM Pathfinding</span>
-  <a href="/logout" style="font-size:10px;color:#667; letter-spacing:2px; text-decoration:none;">[ LOGOUT ]</a>
+  <span>
+    <a href="/settings" style="font-size:10px;color:#88aacc; letter-spacing:2px; text-decoration:none; margin-right:14px;">[ ⚙ SETTINGS ]</a>
+    <a href="/logout" style="font-size:10px;color:#667; letter-spacing:2px; text-decoration:none;">[ LOGOUT ]</a>
+  </span>
 </h1>
 
 <div class="layout">
@@ -198,11 +212,31 @@
       <h3>Grid Configuration</h3>
 
       <div class="srow">
+        <label>Mission objective (free text — instructs the LLM)</label>
+        <textarea id="mission-text" rows="3"
+          oninput="saveConfig()"
+          placeholder="Write your mission here. Examples:&#10;• Visit A then B then C in that order.&#10;• Reach the closest target avoiding risky cells.&#10;• Patrol cautiously; if you see anything unexpected stop and alert."
+          style="width:100%;background:#070a14;color:#c8d8c0;border:1px solid #1a3a2a;padding:8px;border-radius:4px;font-family:inherit;font-size:12px;resize:vertical;"></textarea>
+      </div>
+
+      <div class="srow">
         <label>LLM model</label>
         <select id="model-select" onchange="saveConfig()" style="width:100%;background:#0c1e14;color:#00ff88;border:1px solid #00ff8866;padding:7px;border-radius:4px;font-family:inherit;font-size:12px;">
-          <option value="gpt-4o-mini">gpt-4o-mini</option>
-          <option value="gpt-4.1-mini">gpt-4.1-mini</option>
-          <option value="gpt-5-mini">gpt-5-mini</option>
+          <optgroup label="OpenAI · fast">
+            <option value="gpt-4o-mini">gpt-4o-mini</option>
+            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+          </optgroup>
+          <optgroup label="OpenAI · reasoning (slower, better plans)">
+            <option value="gpt-5-mini">gpt-5-mini · reasoning</option>
+            <option value="o4-mini">o4-mini · reasoning</option>
+          </optgroup>
+          <optgroup label="Google Gemini · fast">
+            <option value="gemini-2.0-flash-lite">gemini-2.0-flash-lite</option>
+            <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+          </optgroup>
+          <optgroup label="Google Gemini · thinking">
+            <option value="gemini-2.5-flash">gemini-2.5-flash · thinking</option>
+          </optgroup>
         </select>
       </div>
 
@@ -226,6 +260,10 @@
         <label>Hidden obstacle movement: <span id="mp-val">50</span>% / step</label>
         <input type="range" id="mp-range" min="0" max="100" value="50" step="10" oninput="document.getElementById('mp-val').textContent=this.value;saveConfig();">
       </div>
+      <div class="srow">
+        <label>Plan refinement passes: <span id="pi-val">1</span>  <span style="color:#556">(1 = fast · 3-5 = "thinking")</span></label>
+        <input type="range" id="pi-range" min="1" max="5" value="1" step="1" oninput="document.getElementById('pi-val').textContent=this.value;saveConfig();">
+      </div>
 
       <div class="btn-row">
         <button class="compact" onclick="randomizeObstacles()">⚄  RANDOMIZE</button>
@@ -240,12 +278,20 @@
         </label>
       </div>
       <div class="btn-row">
-        <button id="btn-place-rover" class="compact" onclick="setEditMode('place-rover')">◈  PLACE ROVER</button>
-        <button id="btn-place-target" class="compact" onclick="setEditMode('place-target')">✦  PLACE TARGET</button>
+        <button id="btn-place-rover" class="compact" onclick="setEditMode('place-rover')">◈  ROVER</button>
+        <button id="btn-place-A" class="compact" onclick="setEditMode('place-A')" style="color:#ffcc00;border-color:#ffcc0066">Ⓐ  PLACE A</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-place-B" class="compact" onclick="setEditMode('place-B')" style="color:#44ccff;border-color:#44ccff66">Ⓑ  PLACE B</button>
+        <button id="btn-place-C" class="compact" onclick="setEditMode('place-C')" style="color:#ff66cc;border-color:#ff66cc66">Ⓒ  PLACE C</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-clear-B" class="compact danger" onclick="clearTarget('B')">✕ B</button>
+        <button id="btn-clear-C" class="compact danger" onclick="clearTarget('C')">✕ C</button>
       </div>
       <button id="btn-launch" onclick="launchMission()" style="border-color:#00ff88aa;font-weight:bold;padding:11px">▶  LAUNCH MISSION</button>
 
-      <p class="hint">Click cells to toggle walls. Use PLACE ROVER / PLACE TARGET to relocate them.</p>
+      <p class="hint">A, B, C are <b>labeled reference points</b> on the map — not mandatory goals. Your mission text tells the LLM what to do with them (visit some, avoid others, patrol, etc). The LLM decides when the mission is done.</p>
     </div>
 
     <!-- ─── MISSION PANEL ───────────────── -->
@@ -283,6 +329,14 @@
       <div id="reasoning">—</div>
     </div>
 
+    <!-- ─── STRATEGY (server-tracked phases) ──── -->
+    <div id="panel-notes" class="panel" style="display:none">
+      <h3>Mission Strategy (server-tracked phases)</h3>
+      <div id="strategy-list" style="background:#070a14;border:1px solid #1a2a3a;border-radius:4px;padding:10px;font-size:11px;line-height:1.7;min-height:60px;">
+        (strategy will appear after first plan call)
+      </div>
+    </div>
+
     <!-- ─── DECISION TIMELINE ───────────── -->
     <div id="panel-decisions" class="panel" style="display:none">
       <h3>Decision Timeline — click to see LLM input</h3>
@@ -307,7 +361,7 @@ let S = null;
 let editGrid = [];
 let editSize = 15;
 let roverPos = [0, 0];
-let targetPos = [14, 14];
+let targets = { A: [14, 14], B: null, C: null };   // B and C optional
 let editMode = 'draw-walls';     // 'draw-walls' | 'place-rover' | 'place-target'
 let inMission = false;
 let running = false;
@@ -320,7 +374,12 @@ function initEditGrid(gs) {
   editSize = gs;
   editGrid = Array.from({length: gs}, () => new Array(gs).fill(0));
   if (roverPos[0] >= gs || roverPos[1] >= gs) roverPos = [0, 0];
-  if (targetPos[0] >= gs || targetPos[1] >= gs) targetPos = [gs-1, gs-1];
+  for (const k of ['A','B','C']) {
+    if (targets[k] && (targets[k][0] >= gs || targets[k][1] >= gs)) {
+      targets[k] = (k === 'A') ? [gs-1, gs-1] : null;
+    }
+  }
+  if (!targets.A) targets.A = [gs-1, gs-1];
   renderSetup();
 }
 
@@ -337,8 +396,25 @@ function onGridSizeChange(v) {
 function setEditMode(mode) {
   editMode = (editMode === mode) ? 'draw-walls' : mode;
   document.getElementById('btn-place-rover').classList.toggle('active', editMode === 'place-rover');
-  document.getElementById('btn-place-target').classList.toggle('active', editMode === 'place-target');
+  for (const k of ['A','B','C']) {
+    const btn = document.getElementById(`btn-place-${k}`);
+    if (btn) btn.classList.toggle('active', editMode === `place-${k}`);
+  }
   renderSetup();
+}
+
+function clearTarget(k) {
+  if (k === 'A') return;  // A is required
+  targets[k] = null;
+  renderSetup();
+  saveConfig();
+}
+
+function targetAt(r, c) {
+  for (const k of ['A','B','C']) {
+    if (targets[k] && targets[k][0] === r && targets[k][1] === c) return k;
+  }
+  return null;
 }
 
 function randomizeObstacles() {
@@ -346,7 +422,8 @@ function randomizeObstacles() {
   const count = parseInt(document.getElementById('fo-range').value);
   editSize = gs;
   editGrid = Array.from({length: gs}, () => new Array(gs).fill(0));
-  const taken = new Set([`${roverPos[0]},${roverPos[1]}`, `${targetPos[0]},${targetPos[1]}`]);
+  const taken = new Set([`${roverPos[0]},${roverPos[1]}`]);
+  for (const k of ['A','B','C']) if (targets[k]) taken.add(`${targets[k][0]},${targets[k][1]}`);
   let placed = 0, tries = 0;
   while (placed < count && tries < 10000) {
     tries++;
@@ -368,25 +445,38 @@ function clearObstacles() {
 
 function cellClick(r, c) {
   if (inMission) return;
+
+  // Placing rover
   if (editMode === 'place-rover') {
-    if (r === targetPos[0] && c === targetPos[1]) return;
+    if (targetAt(r, c)) return;
     roverPos = [r, c];
     if (editGrid[r][c]) editGrid[r][c] = 0;
-    setEditMode('place-rover');   // toggle off
-    renderSetup();
-    saveConfig();
+    setEditMode('place-rover');
+    renderSetup(); saveConfig();
     return;
   }
-  if (editMode === 'place-target') {
-    if (r === roverPos[0] && c === roverPos[1]) return;
-    targetPos = [r, c];
-    if (editGrid[r][c]) editGrid[r][c] = 0;
-    setEditMode('place-target');
-    renderSetup();
-    saveConfig();
-    return;
+
+  // Placing target A/B/C
+  for (const k of ['A','B','C']) {
+    if (editMode === `place-${k}`) {
+      if (r === roverPos[0] && c === roverPos[1]) return;
+      // Clear any other target sitting on this cell first
+      for (const other of ['A','B','C']) {
+        if (other !== k && targets[other] && targets[other][0] === r && targets[other][1] === c) {
+          targets[other] = (other === 'A') ? targets[other] : null;
+        }
+      }
+      targets[k] = [r, c];
+      if (editGrid[r][c]) editGrid[r][c] = 0;
+      setEditMode(`place-${k}`);
+      renderSetup(); saveConfig();
+      return;
+    }
   }
-  if ((r === roverPos[0] && c === roverPos[1]) || (r === targetPos[0] && c === targetPos[1])) return;
+
+  // Default: toggle wall
+  if (r === roverPos[0] && c === roverPos[1]) return;
+  if (targetAt(r, c)) return;
   editGrid[r][c] = editGrid[r][c] ? 0 : 1;
   renderSetup();
   saveConfig();
@@ -410,10 +500,10 @@ function renderSetup() {
   for (let r = 0; r < gs; r++) {
     for (let c = 0; c < gs; c++) {
       const isRover = r === roverPos[0] && c === roverPos[1];
-      const isTarget = r === targetPos[0] && c === targetPos[1];
+      const tgtKey = targetAt(r, c);
       let cls = 'cell', txt = '';
       if (isRover)            { cls += ' c-rover'; txt = '◈'; }
-      else if (isTarget)      { cls += ' c-tgt';   txt = '✦'; }
+      else if (tgtKey)        { cls += ` c-tgt tgt-${tgtKey}`; txt = tgtKey; }
       else if (editGrid[r][c]){ cls += ' c-wall';  txt = '▪'; }
       else                    { cls += ' c-clr'; }
       html += `<div class="${cls}" style="width:${sz}px;height:${sz}px;font-size:${fs}px"
@@ -437,7 +527,12 @@ function renderMission() {
   const walls    = new Set((S.known_walls||[]).map(([r,c]) => `${r},${c}`));
   const stale    = new Set((S.stale_walls||[]).map(([r,c]) => `${r},${c}`));
   const [rr, rc] = S.rover;
-  const [tr, tc] = S.target;
+  const missionTargets = S.targets || [];
+  const tgtMap = new Map();
+  for (const t of missionTargets) tgtMap.set(`${t.pos[0]},${t.pos[1]}`, t);
+  // Discovered landmarks
+  const lmMap = new Map();
+  for (const lm of (S.landmarks || [])) lmMap.set(`${lm.pos[0]},${lm.pos[1]}`, lm.label);
   const heading = S.heading || 'S';
   const fwdR = S.forward_range || 3;
   const backR = S.back_range || 2;
@@ -489,9 +584,10 @@ function renderMission() {
       const k = `${r},${c}`;
       let cls = 'cell', txt = '';
       if (r===rr && c===rc)            { cls += ' c-rover'; txt = roverGlyph[heading] || '◈'; }
-      else if (r===tr && c===tc)       { cls += ' c-tgt';   txt = '✦'; }
+      else if (tgtMap.has(k))          { const t = tgtMap.get(k); cls += ` c-tgt tgt-${t.label}` + (t.visited ? ' visited' : ''); txt = t.label; }
       else if (walls.has(k))           { cls += ' c-wall' + (stale.has(k) ? ' stale' : ''); txt = '▪'; }
       else if (planMap.has(k))         { cls += ' c-plan' + (!revealed.has(k) ? ' through-unk' : ''); txt = planMap.get(k); }
+      else if (lmMap.has(k))           { cls += ' c-landmark'; txt = lmMap.get(k); }
       else if (!revealed.has(k))       { cls += ' c-unk'; }
       else if (trail.has(k))           { cls += ' c-trail'; txt = '·'; }
       else if (failedPath.has(k))      { cls += ' c-fail';  txt = '✕'; }
@@ -511,13 +607,19 @@ async function launchMission() {
   const fr = parseInt(document.getElementById('fr-range').value);
   const hc = parseInt(document.getElementById('ho-range').value);
   const mp = parseInt(document.getElementById('mp-range').value) / 100;
+  const planIterations = parseInt(document.getElementById('pi-range').value);
   const model = document.getElementById('model-select').value;
+  const mission = document.getElementById('mission-text').value.trim();
+
+  const targetList = ['A','B','C']
+    .filter(k => targets[k])
+    .map(k => ({label: k, pos: targets[k]}));
 
   const data = await api('/api/start', {
     forward_range: fr, grid_size: gs, hidden_count: hc,
-    move_prob: mp, model,
+    move_prob: mp, model, mission, plan_iterations: planIterations,
     grid: editGrid.map(row => row.slice()),
-    rover: roverPos, target: targetPos,
+    rover: roverPos, targets: targetList,
   });
   if (!data) { inMission = false; return; }
   S = data;
@@ -529,11 +631,13 @@ async function launchMission() {
   document.getElementById('panel-mission').style.display = '';
   document.getElementById('panel-stats').style.display = '';
   document.getElementById('panel-reason').style.display = '';
+  document.getElementById('panel-notes').style.display = '';
   document.getElementById('panel-decisions').style.display = '';
   document.getElementById('panel-log').style.display = '';
   document.getElementById('mode-badge').className = 'mode-badge mode-mission';
   document.getElementById('mode-badge').textContent = 'MISSION ACTIVE';
   document.getElementById('reasoning').textContent = 'Mission launched. Click GO to begin.';
+  document.getElementById('notes').textContent = '—';
 
   renderMission(); updateStats(); updateLog(); updateDecisions();
 }
@@ -546,6 +650,7 @@ function backToSetup() {
   document.getElementById('panel-mission').style.display = 'none';
   document.getElementById('panel-stats').style.display = 'none';
   document.getElementById('panel-reason').style.display = 'none';
+  document.getElementById('panel-notes').style.display = 'none';
   document.getElementById('panel-decisions').style.display = 'none';
   document.getElementById('panel-log').style.display = 'none';
   document.getElementById('mode-badge').className = 'mode-badge mode-setup';
@@ -568,8 +673,10 @@ async function planRoute() {
   const tag = data.source === 'bfs' ? '⚙ BFS'
             : data.source === 'llm_stuck' ? '✦ STUCK'
             : data.source === 'llm_rescued' ? '🛟 LLM+BFS rescue'
+            : data.source === 'llm_done' ? '🏁 MISSION COMPLETE'
             : '🧠 LLM';
   document.getElementById('reasoning').textContent = `[${tag}] ${data.reasoning || ''}`;
+  renderStrategy();
   renderMission(); updateStats(); updateLog(); updateDecisions();
   return true;
 }
@@ -596,10 +703,34 @@ async function execStep() {
   const data = await api('/api/step');
   if (!data || data.error) return data?.error || 'fail';
   S = data;
-  if (data.event === 'moved') trail.add(`${S.rover[0]},${S.rover[1]}`);
+  if (data.event === 'moved' || data.event === 'phase_complete') {
+    trail.add(`${S.rover[0]},${S.rover[1]}`);
+  }
   if (data.event === 'replan') failedPath = prePlan;
+  renderStrategy();
   renderMission(); updateStats(); updateLog(); updateDecisions();
   return data.event;
+}
+
+function renderStrategy() {
+  const el = document.getElementById('strategy-list');
+  if (!el || !S) return;
+  const phases = S.strategy || [];
+  const idx = S.current_phase_idx || 0;
+  if (!phases.length) {
+    el.innerHTML = '<i style="color:#667">(strategy not generated yet)</i>';
+    return;
+  }
+  el.innerHTML = phases.map((p, i) => {
+    const status = p.done ? '✓' : (i === idx ? '▶' : '○');
+    const color  = p.done ? '#66aa44' : (i === idx ? '#ffaa44' : '#778');
+    const weight = i === idx ? 'bold' : 'normal';
+    const decor  = p.done ? 'line-through' : 'none';
+    return `<div style="color:${color};font-weight:${weight};text-decoration:${decor}">
+      ${status} <b>Phase ${i+1}:</b> ${escapeHtml(p.goal)}
+      <span style="color:#667;font-size:10px"> → (${p.end_when_pos[0]},${p.end_when_pos[1]})</span>
+    </div>`;
+  }).join('');
 }
 
 async function toggleGo() {
@@ -619,23 +750,35 @@ async function toggleGo() {
 async function autoLoop() {
   const btn = document.getElementById('btn-go');
   while (running) {
-    if (!S || S.done) { running = false; break; }
+    if (!S || S.done) {
+      running = false;
+      banner('🏁 MISSION COMPLETE');
+      btn.textContent = '▶  GO'; btn.classList.remove('running');
+      break;
+    }
     if (S.plan.length === 0) {
       const ok = await planRoute();
       if (!ok) { running = false; btn.textContent='▶  GO'; btn.classList.remove('running'); break; }
       if (!running) break;
+      if (S.done) {
+        running = false;
+        banner('🏁 MISSION COMPLETE');
+        btn.textContent = '▶  GO'; btn.classList.remove('running');
+        break;
+      }
       await sleep(150);
       continue;
     }
     const ev = await execStep();
-    if (ev === 'done') {
-      running = false;
-      banner('🎯 TARGET REACHED');
-      btn.textContent = '▶  GO'; btn.classList.remove('running');
-      break;
-    }
     if (ev === 'replan') {
       document.getElementById('reasoning').textContent = '⟳ Route failed — recalculating…';
+      await sleep(300);
+      await planRoute();
+      await sleep(150);
+      continue;
+    }
+    if (ev === 'phase_complete') {
+      document.getElementById('reasoning').textContent = '✓ Phase complete — planning next phase…';
       await sleep(300);
       await planRoute();
       await sleep(150);
@@ -683,11 +826,21 @@ async function importMission(event) {
     if (cfg.grid_size) set('gs-range', cfg.grid_size);
     if (cfg.forward_range) set('fr-range', cfg.forward_range);
     if (cfg.move_prob !== undefined) set('mp-range', Math.round(cfg.move_prob * 100));
+    if (cfg.plan_iterations !== undefined) set('pi-range', cfg.plan_iterations);
     if (data.meta?.model) document.getElementById('model-select').value = data.meta.model;
 
     const gs = cfg.grid_size || editGrid.length;
     if (ep.start_pos) roverPos = ep.start_pos;
-    if (ep.target)    targetPos = ep.target;
+    // Restore targets: prefer new format, fallback to legacy single target
+    targets = { A: null, B: null, C: null };
+    if (Array.isArray(ep.targets)) {
+      for (const t of ep.targets) {
+        if (t && t.label && targets.hasOwnProperty(t.label)) targets[t.label] = t.pos;
+      }
+    } else if (ep.target) {
+      targets.A = ep.target;
+    }
+    if (!targets.A) targets.A = [gs-1, gs-1];
 
     // Build editGrid from initial_grid if present
     if (data.initial_grid && data.initial_grid.length === gs) {
@@ -826,8 +979,10 @@ function saveConfig() {
       ho: parseInt(document.getElementById('ho-range').value),
       fr: parseInt(document.getElementById('fr-range').value),
       mp: parseInt(document.getElementById('mp-range').value),
+      pi: parseInt(document.getElementById('pi-range').value),
       model: document.getElementById('model-select').value,
-      rover: roverPos, target: targetPos,
+      mission: document.getElementById('mission-text').value,
+      rover: roverPos, targets: targets,
       grid: editGrid,
     }));
   } catch(_) {}
@@ -844,13 +999,23 @@ function loadConfig() {
     if (c.ho !== undefined) set('ho-range', c.ho);
     if (c.fr !== undefined) set('fr-range', c.fr);
     if (c.mp !== undefined) set('mp-range', c.mp);
+    if (c.pi !== undefined) set('pi-range', c.pi);
+    if (c.mission !== undefined) {
+      document.getElementById('mission-text').value = c.mission;
+    }
     if (c.model) {
       const sel = document.getElementById('model-select');
       const ok = Array.from(sel.options).some(o => o.value === c.model);
       sel.value = ok ? c.model : 'gpt-4o-mini';
     }
-    if (c.rover && c.target && c.grid && c.grid.length === c.gs) {
-      roverPos = c.rover; targetPos = c.target;
+    if (c.rover && c.grid && c.grid.length === c.gs) {
+      roverPos = c.rover;
+      // Back-compat: old configs had single c.target; new ones have c.targets
+      if (c.targets && typeof c.targets === 'object' && c.targets.A) {
+        targets = { A: c.targets.A || null, B: c.targets.B || null, C: c.targets.C || null };
+      } else if (c.target) {
+        targets = { A: c.target, B: null, C: null };
+      }
       editGrid = c.grid; editSize = c.gs;
       renderSetup();
     }
