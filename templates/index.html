@@ -46,7 +46,10 @@
     opacity: 0.45;
     text-decoration: line-through;
   }
-  .c-landmark { background: #1a1e2a; color: #aa88ee; border: 1px dashed #6655aa; font-weight: bold; }
+  .c-painted { background: #103027; color: #7fffd4; box-shadow: inset 0 0 0 2px #00ffaa99; }
+  .c-rover.c-painted { background: #102438; color: #44aaff; border-color: #44aaff; box-shadow: inset 0 0 0 3px #00ffaa99; }
+  .c-wall.c-painted { background: #26301a; color: #d6ff88; }
+  .c-unk.c-painted { background: #10252a; color: #88ffee; }
   .c-sens  { outline: 1px solid #00ff8818; outline-offset: -1px; }
   .c-trail { background: #0a1e10; color: #1a6633; }
   .c-fail  { background: #200a0a; color: #663322; }
@@ -68,6 +71,7 @@
   /* setup mode interactions */
   .edit-mode.draw-walls .cell:not(.c-rover):not(.c-tgt):hover { background: #1a3a20; cursor: pointer; }
   .edit-mode.draw-walls .cell.c-wall:hover { background: #5a2020; }
+  .edit-mode.paint .cell:not(.c-rover):not(.c-tgt):hover { background: #12362d; cursor: cell; outline: 1px dashed #00ffaa; }
   .edit-mode.place-rover .cell:not(.c-tgt):hover { background: #1a3050; cursor: crosshair; outline: 1px dashed #44aaff; }
   .edit-mode.place-target .cell:not(.c-rover):hover { background: #3a2a08; cursor: crosshair; outline: 1px dashed #ffcc00; }
 
@@ -124,6 +128,7 @@
   .log-line.plan  { color: #aaee88; }
   .log-line.bfs   { color: #ddaa44; }
   .log-line.stuck { color: #ff88cc; }
+  .log-line.paint { color: #7fffd4; }
   .log-line.ctx pre {
     margin-top: 4px;
     padding: 6px 8px;
@@ -267,16 +272,17 @@
 
       <div class="btn-row">
         <button class="compact" onclick="randomizeObstacles()">⚄  RANDOMIZE</button>
-        <button class="compact danger" onclick="clearObstacles()">✕  CLEAR</button>
+        <button id="btn-paint-mode" class="compact" onclick="setEditMode('paint')">🖌️ PAINT</button>
       </div>
       <div class="btn-row">
+        <button class="compact danger" onclick="clearObstacles()">✕  CLEAR ALL</button>
         <button class="compact" onclick="document.getElementById('import-file').click()">📁  IMPORT JSON</button>
-        <input type="file" id="import-file" accept=".json,application/json" style="display:none" onchange="importMission(event)">
-        <label class="compact" style="display:flex;align-items:center;gap:6px;font-size:11px;color:#889988;border:1px solid #1a2e1a;background:#0a0f18;padding:6px 10px;border-radius:4px;cursor:pointer;">
-          <input type="checkbox" id="exact-replay" style="accent-color:#00ff88;cursor:pointer">
-          Exact replay
-        </label>
       </div>
+      <input type="file" id="import-file" accept=".json,application/json" style="display:none" onchange="importMission(event)">
+      <label class="compact" style="display:flex;align-items:center;gap:6px;font-size:11px;color:#889988;border:1px solid #1a2e1a;background:#0a0f18;padding:6px 10px;border-radius:4px;cursor:pointer;">
+        <input type="checkbox" id="exact-replay" style="accent-color:#00ff88;cursor:pointer">
+        Exact replay
+      </label>
       <div class="btn-row">
         <button id="btn-place-rover" class="compact" onclick="setEditMode('place-rover')">◈  ROVER</button>
         <button id="btn-place-A" class="compact" onclick="setEditMode('place-A')" style="color:#ffcc00;border-color:#ffcc0066">Ⓐ  PLACE A</button>
@@ -317,6 +323,8 @@
       <div class="stat-row">Efficiency <span id="m-eff" class="val">—</span></div>
       <div class="stat-row">Plan completion <span id="m-comp" class="val">—</span></div>
       <div class="stat-row">LLM calls <span id="m-llm" class="val">—</span></div>
+      <div class="stat-row">Commands <span id="m-commands" class="val">—</span></div>
+      <div class="stat-row">By command <span id="m-command-list" class="val">—</span></div>
       <div class="stat-row">Crashes / aborts <span id="m-fail" class="val">—</span></div>
       <div class="stat-row">Steps / replans <span id="m-steps" class="val">—</span></div>
       <div class="stat-row">Rover <span id="s-pos" class="val">—</span></div>
@@ -362,7 +370,8 @@ let editGrid = [];
 let editSize = 15;
 let roverPos = [0, 0];
 let targets = { A: [14, 14], B: null, C: null };   // B and C optional
-let editMode = 'draw-walls';     // 'draw-walls' | 'place-rover' | 'place-target'
+let paintedCells = new Set();
+let editMode = 'draw-walls';     // 'draw-walls' | 'place-rover' | 'place-target' | 'paint'
 let inMission = false;
 let running = false;
 let trail = new Set();
@@ -373,6 +382,7 @@ let openDecisionId = null;
 function initEditGrid(gs) {
   editSize = gs;
   editGrid = Array.from({length: gs}, () => new Array(gs).fill(0));
+  paintedCells = new Set();
   if (roverPos[0] >= gs || roverPos[1] >= gs) roverPos = [0, 0];
   for (const k of ['A','B','C']) {
     if (targets[k] && (targets[k][0] >= gs || targets[k][1] >= gs)) {
@@ -396,6 +406,7 @@ function onGridSizeChange(v) {
 function setEditMode(mode) {
   editMode = (editMode === mode) ? 'draw-walls' : mode;
   document.getElementById('btn-place-rover').classList.toggle('active', editMode === 'place-rover');
+  document.getElementById('btn-paint-mode').classList.toggle('active', editMode === 'paint');
   for (const k of ['A','B','C']) {
     const btn = document.getElementById(`btn-place-${k}`);
     if (btn) btn.classList.toggle('active', editMode === `place-${k}`);
@@ -415,6 +426,27 @@ function targetAt(r, c) {
     if (targets[k] && targets[k][0] === r && targets[k][1] === c) return k;
   }
   return null;
+}
+
+function paintKey(r, c) {
+  return `${r},${c}`;
+}
+
+function paintedCellsArray() {
+  return Array.from(paintedCells).map(k => k.split(',').map(Number));
+}
+
+function setPaintedCells(cells) {
+  const gs = editGrid.length || parseInt(document.getElementById('gs-range').value) || 15;
+  paintedCells = new Set();
+  for (const cell of cells || []) {
+    if (!Array.isArray(cell) || cell.length !== 2) continue;
+    const r = Number(cell[0]);
+    const c = Number(cell[1]);
+    if (Number.isInteger(r) && Number.isInteger(c) && r >= 0 && c >= 0 && r < gs && c < gs) {
+      paintedCells.add(paintKey(r, c));
+    }
+  }
 }
 
 function randomizeObstacles() {
@@ -450,6 +482,7 @@ function cellClick(r, c) {
   if (editMode === 'place-rover') {
     if (targetAt(r, c)) return;
     roverPos = [r, c];
+    paintedCells.delete(paintKey(r, c));
     if (editGrid[r][c]) editGrid[r][c] = 0;
     setEditMode('place-rover');
     renderSetup(); saveConfig();
@@ -467,11 +500,23 @@ function cellClick(r, c) {
         }
       }
       targets[k] = [r, c];
+      paintedCells.delete(paintKey(r, c));
       if (editGrid[r][c]) editGrid[r][c] = 0;
       setEditMode(`place-${k}`);
       renderSetup(); saveConfig();
       return;
     }
+  }
+
+  if (editMode === 'paint') {
+    if (r === roverPos[0] && c === roverPos[1]) return;
+    if (targetAt(r, c)) return;
+    const k = paintKey(r, c);
+    if (paintedCells.has(k)) paintedCells.delete(k);
+    else paintedCells.add(k);
+    renderSetup();
+    saveConfig();
+    return;
   }
 
   // Default: toggle wall
@@ -501,11 +546,13 @@ function renderSetup() {
     for (let c = 0; c < gs; c++) {
       const isRover = r === roverPos[0] && c === roverPos[1];
       const tgtKey = targetAt(r, c);
+      const k = paintKey(r, c);
       let cls = 'cell', txt = '';
       if (isRover)            { cls += ' c-rover'; txt = '◈'; }
       else if (tgtKey)        { cls += ` c-tgt tgt-${tgtKey}`; txt = tgtKey; }
       else if (editGrid[r][c]){ cls += ' c-wall';  txt = '▪'; }
       else                    { cls += ' c-clr'; }
+      if (!isRover && !tgtKey && paintedCells.has(k)) cls += ' c-painted';
       html += `<div class="${cls}" style="width:${sz}px;height:${sz}px;font-size:${fs}px"
                     onclick="cellClick(${r},${c})"></div>`;
     }
@@ -530,9 +577,7 @@ function renderMission() {
   const missionTargets = S.targets || [];
   const tgtMap = new Map();
   for (const t of missionTargets) tgtMap.set(`${t.pos[0]},${t.pos[1]}`, t);
-  // Discovered landmarks
-  const lmMap = new Map();
-  for (const lm of (S.landmarks || [])) lmMap.set(`${lm.pos[0]},${lm.pos[1]}`, lm.label);
+  const painted = new Set((S.painted_cells || []).map(([r,c]) => `${r},${c}`));
   const heading = S.heading || 'S';
   const fwdR = S.forward_range || 3;
   const backR = S.back_range || 2;
@@ -587,11 +632,11 @@ function renderMission() {
       else if (tgtMap.has(k))          { const t = tgtMap.get(k); cls += ` c-tgt tgt-${t.label}` + (t.visited ? ' visited' : ''); txt = t.label; }
       else if (walls.has(k))           { cls += ' c-wall' + (stale.has(k) ? ' stale' : ''); txt = '▪'; }
       else if (planMap.has(k))         { cls += ' c-plan' + (!revealed.has(k) ? ' through-unk' : ''); txt = planMap.get(k); }
-      else if (lmMap.has(k))           { cls += ' c-landmark'; txt = lmMap.get(k); }
       else if (!revealed.has(k))       { cls += ' c-unk'; }
       else if (trail.has(k))           { cls += ' c-trail'; txt = '·'; }
       else if (failedPath.has(k))      { cls += ' c-fail';  txt = '✕'; }
       else                             { cls += ' c-clr'; }
+      if (painted.has(k) && (!tgtMap.has(k) || (r===rr && c===rc))) cls += ' c-painted';
       if ((r!==rr || c!==rc) && sens.has(k)) cls += ' c-sens';
       html += `<div class="${cls}" style="width:${sz}px;height:${sz}px;font-size:${fs}px">${txt}</div>`;
     }
@@ -620,6 +665,7 @@ async function launchMission() {
     move_prob: mp, model, mission, plan_iterations: planIterations,
     grid: editGrid.map(row => row.slice()),
     rover: roverPos, targets: targetList,
+    painted_cells: paintedCellsArray(),
   });
   if (!data) { inMission = false; return; }
   S = data;
@@ -853,6 +899,7 @@ async function importMission(event) {
       }
       editSize = gs;
     }
+    setPaintedCells(data.painted_cells || data.overlays?.painted_cells || []);
 
     renderSetup();
     saveConfig();
@@ -886,12 +933,13 @@ function updateStats() {
   set('m-model',   S.model || '—');
   set('m-elapsed', `${m.elapsed_s ?? 0}s`);
   set('m-eff',     m.path_efficiency != null ? m.path_efficiency.toFixed(2) : '—');
-  set('m-dist',    `${m.manhattan_remaining ?? '—'} / ${m.manhattan_initial ?? '—'}`);
   set('m-comp',    m.plan_completion_avg != null ? Math.round(m.plan_completion_avg * 100) + '%' : '—');
   set('m-llm',     `${m.llm_calls || 0} (${m.llm_avg_ms || 0}ms avg, last ${m.llm_last_ms || 0}ms)`);
-  set('m-bfs',     `${m.bfs_calls || 0} / ${m.stuck_calls || 0}`);
   set('m-fail',    `${m.crashes || 0} / ${m.aborts || 0}`);
-  set('m-move',    `${m.rotations || 0} / ${m.forwards || 0} / ${m.backwards || 0}`);
+  const counts = m.command_counts || {};
+  const commandParts = ['F','B','L','R','P'].map(cmd => `${cmd} ${counts[cmd] || 0}`);
+  set('m-commands', `${m.commands_sent || 0} sent · ${S.plan.length} pending`);
+  set('m-command-list', commandParts.join(' · '));
   set('m-steps',   `${S.steps} · ${S.recalculations} (${S.plan.length} pend.)`);
 
   const w = S.replans_window || 0;
@@ -921,6 +969,7 @@ function updateLog() {
     else if (line.startsWith('🧠')) cls += ' plan';
     else if (line.startsWith('⚙'))  cls += ' bfs';
     else if (line.startsWith('✦'))  cls += ' stuck';
+    else if (line.startsWith('🎨')) cls += ' paint';
     else if (line.includes('⚠'))   cls += ' warn';
     else if (line.includes('✓'))   cls += ' ok';
     return `<div class="${cls}">${escapeHtml(line)}</div>`;
@@ -936,7 +985,7 @@ function updateDecisions() {
     const preview = d.plan.slice(0, 10).join(' ') + (d.plan.length > 10 ? '…' : '');
     const isOpen = openDecisionId === d.id ? ' open' : '';
     return `<div class="dec ${d.source}${isOpen}" onclick="toggleDecision(${d.id})">
-      <div class="dec-head"><span>${icon} ${label} #${d.id}</span><span>step ${d.step} · ${d.plan.length} moves</span></div>
+      <div class="dec-head"><span>${icon} ${label} #${d.id}</span><span>step ${d.step} · ${d.plan.length} commands</span></div>
       <div class="dec-meta">from (${d.rover[0]},${d.rover[1]}) — plan: ${preview}</div>
       <div class="dec-reason">${escapeHtml(d.reasoning)}</div>
       <div class="dec-grid">${escapeHtml(d.ascii_grid || '(no grid)')}</div>
@@ -984,6 +1033,7 @@ function saveConfig() {
       mission: document.getElementById('mission-text').value,
       rover: roverPos, targets: targets,
       grid: editGrid,
+      painted_cells: paintedCellsArray(),
     }));
   } catch(_) {}
 }
@@ -1017,6 +1067,7 @@ function loadConfig() {
         targets = { A: c.target, B: null, C: null };
       }
       editGrid = c.grid; editSize = c.gs;
+      setPaintedCells(c.painted_cells || []);
       renderSetup();
     }
     return true;

@@ -113,12 +113,10 @@ LOGIN_HTML = """<!DOCTYPE html>
 # Cell types in the real grid
 EMPTY, FIXED, HIDDEN = 0, 1, 2
 
-# Discoverable landmarks (letters that the rover learns about by scanning)
-LANDMARK_LABELS = list("DEFGHIJKLM")  # 10 letters, won't collide with A/B/C markers
 DIRS = {"N": (-1, 0), "S": (1, 0), "W": (0, -1), "E": (0, 1)}
 
 # Relative rover commands
-VALID_MOVES = ("F", "B", "L", "R")
+VALID_MOVES = ("F", "B", "L", "R", "P")
 TURN_LEFT  = {"N": "W", "W": "S", "S": "E", "E": "N"}
 TURN_RIGHT = {"N": "E", "E": "S", "S": "W", "W": "N"}
 OPPOSITE   = {"N": "S", "S": "N", "E": "W", "W": "E"}
@@ -135,6 +133,8 @@ def apply_command(heading, command):
         return TURN_LEFT[heading], 0, 0
     if command == "R":
         return TURN_RIGHT[heading], 0, 0
+    if command == "P":
+        return heading, 0, 0
     raise ValueError(f"unknown command {command!r}")
 
 
@@ -153,6 +153,8 @@ def simulate_plan(rover, heading, plan):
         elif cmd == "B":
             dr, dc = DIRS[OPPOSITE[h]]
             r, c = r + dr, c + dc
+        elif cmd == "P":
+            pass
     return (r, c), h
 
 
@@ -222,7 +224,8 @@ game = {}
 # ─── World / state init ───────────────────────────────────────────────────
 def init_game(forward_range, grid_size, hidden_count, move_prob,
               move_prob_fixed=0.0, manual_grid=None, rover=None, target=None,
-              targets=None, model=None, mission=None, plan_iterations=1):
+              targets=None, model=None, mission=None, plan_iterations=1,
+              painted_cells=None):
     rover = list(rover) if rover else [0, 0]
 
     # Normalize targets: prefer multi-target list, fallback to single target
@@ -270,16 +273,18 @@ def init_game(forward_range, grid_size, hidden_count, move_prob,
                     placed.add((r, c))
                     break
 
-    # Place discoverable landmarks (D-M) on empty cells. They don't block movement.
-    landmarks = []
-    for label in LANDMARK_LABELS:
-        for _ in range(300):
-            r = random.randint(0, grid_size - 1)
-            c = random.randint(0, grid_size - 1)
-            if (r, c) not in placed and grid[r][c] == EMPTY:
-                landmarks.append({"label": label, "pos": [r, c], "discovered": False})
-                placed.add((r, c))
-                break
+    painted = []
+    seen_painted = set()
+    for cell in painted_cells or []:
+        if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+            continue
+        try:
+            r, c = int(cell[0]), int(cell[1])
+        except (TypeError, ValueError):
+            continue
+        if 0 <= r < grid_size and 0 <= c < grid_size and (r, c) not in seen_painted:
+            painted.append([r, c])
+            seen_painted.add((r, c))
 
     state = {
         "grid": grid,
@@ -296,7 +301,7 @@ def init_game(forward_range, grid_size, hidden_count, move_prob,
         "model": model or MODEL,
         "mission": (mission or "Reach the target efficiently.").strip(),
         "plan_iterations": max(1, min(int(plan_iterations or 1), 6)),
-        "landmarks": landmarks,
+        "painted_cells": painted,
         "revealed": [],
         "known_walls": [],
         "plan": [],
@@ -314,6 +319,8 @@ def init_game(forward_range, grid_size, hidden_count, move_prob,
             "bfs_calls": 0, "stuck_calls": 0,
             "crashes": 0, "aborts": 0, "boundary_hits": 0,
             "rotations": 0, "forwards": 0, "backwards": 0,
+            "paints": 0, "commands_sent": 0,
+            "command_counts": {cmd: 0 for cmd in VALID_MOVES},
             "last_plan_total": 0, "last_plan_used": 0,
             "plan_completion_rates": [],
         },
@@ -348,13 +355,6 @@ def reveal_sensor(state, log_events=True):
     state["revealed"] = [list(x) for x in revealed]
     state["known_walls"] = [list(x) for x in known]
 
-    # Discover landmarks within sensor scan
-    new_landmarks = []
-    for lm in state.get("landmarks", []):
-        if not lm["discovered"] and tuple(lm["pos"]) in scan:
-            lm["discovered"] = True
-            new_landmarks.append(lm)
-
     if log_events:
         if new_walls:
             coords = ", ".join(f"({r},{c})" for r, c in new_walls[:4])
@@ -363,9 +363,6 @@ def reveal_sensor(state, log_events=True):
         if cleared:
             coords = ", ".join(f"({r},{c})" for r, c in cleared[:3])
             state["log"].append(f"💨 Memory cleared at {coords} (obstacle moved)")
-        if new_landmarks:
-            txt = ", ".join(f"{lm['label']} at ({lm['pos'][0]},{lm['pos'][1]})" for lm in new_landmarks)
-            state["log"].append(f"🔎 Discovered landmark: {txt}")
 
 
 def move_obstacles(state, prob_hidden, prob_fixed):
@@ -453,6 +450,7 @@ def build_llm_ascii(state):
     target = tuple(state["target"])
     revealed = set(map(tuple, state["revealed"]))
     walls = set(map(tuple, state["known_walls"]))
+    painted = set(map(tuple, state.get("painted_cells", [])))
 
     rows = []
     for r in range(gs):
@@ -464,6 +462,8 @@ def build_llm_ascii(state):
                 row.append("T")
             elif (r, c) in walls:
                 row.append("#")
+            elif (r, c) in painted:
+                row.append("*")
             elif (r, c) in revealed:
                 row.append(".")
             else:
@@ -478,9 +478,18 @@ def validate_moves(raw):
         raw = [x.strip().upper() for x in raw.replace(",", " ").split()]
     if not isinstance(raw, list):
         return [], [raw]
-    clean = [m for m in raw if isinstance(m, str) and m.upper() in VALID_MOVES]
-    clean = [m.upper() for m in clean]
-    dropped = [m for m in raw if not (isinstance(m, str) and m.upper() in VALID_MOVES)]
+    aliases = {"PINTA": "P", "PINTAR": "P", "PAINT": "P"}
+    clean = []
+    dropped = []
+    for m in raw:
+        if not isinstance(m, str):
+            dropped.append(m)
+            continue
+        cmd = aliases.get(m.strip().upper(), m.strip().upper())
+        if cmd in VALID_MOVES:
+            clean.append(cmd)
+        else:
+            dropped.append(m)
     return clean, dropped
 
 
@@ -500,13 +509,6 @@ def ask_llm(state, stuck_hint=None, retries=1, refine_context=None, tactical_pha
         seen = "visited" if t.get("visited") else "not visited yet"
         marker_lines.append(f"  {t['label']} → (row {t['pos'][0]}, col {t['pos'][1]})  [{seen}]")
     marker_block = "\n".join(marker_lines) if marker_lines else "  (no markers placed)"
-
-    discovered = [lm for lm in state.get("landmarks", []) if lm.get("discovered")]
-    if discovered:
-        lm_lines = "\n".join(f"  {lm['label']} at (row {lm['pos'][0]}, col {lm['pos'][1]})" for lm in discovered)
-        landmark_block = lm_lines
-    else:
-        landmark_block = "  (none discovered yet — they appear as the rover scans them)"
 
     # Recent decisions for continuity across plan calls
     recent = state.get("decisions", [])[-3:]
@@ -559,9 +561,6 @@ MISSION (operator instruction — HIGHEST PRIORITY, this defines what success me
 LABELED REFERENCE POINTS on the map (you decide what to do with them based on the mission):
 {marker_block}
 
-DISCOVERED LANDMARKS (random letters the rover has scanned and now remembers their position — useful for navigation reference):
-{landmark_block}
-
 CURRENT STATE
   Rover at (row {rover[0]}, col {rover[1]}), facing {heading}.
   Rover STARTED at (row {start_pos[0]}, col {start_pos[1]})  ← this is "origin" / "home" / "start point" if the mission mentions it.
@@ -577,13 +576,14 @@ GRID (row 0 = top, col 0 = left, N=up S=down E=right W=left):
 
 Legend:
   R = rover (facing {heading})        A/B/C = labeled reference points (NOT mandatory destinations — see mission)
-  # = known obstacle (impassable)     . = confirmed clear     ? = unscanned
+  # = known obstacle (impassable)     . = confirmed clear     * = painted clear cell     ? = unscanned
 
 RELATIVE COMMANDS (interpreted from current heading):
   F = move 1 cell FORWARD in heading direction
   B = move 1 cell BACKWARD (opposite of heading; heading does NOT change)
   L = rotate 90° LEFT in place (no movement)
   R = rotate 90° RIGHT in place (no movement)
+  P = PINTA / PAINT the current cell only (no movement, no rotation, no sensor scan, no obstacle tick)
 
 SENSOR (cross-shape, rotates with heading):
   {fwd_r} cells ahead · 2 behind · 1 each side
@@ -593,8 +593,10 @@ INTERPRETATION RULES:
   • If the mission says "visit A then B" → visit them.
   • If the mission says "ignore C" or "stay away from B" → respect that.
   • If the mission gives a free instruction (patrol, explore, etc.) → use your judgment.
+  • Use P only when the mission asks you to paint, mark, or color the cell you are standing on.
+  • P only changes that cell to painted. It does not move, rotate, scan, advance obstacles, complete a target, or do anything else.
   • You may use up to {gs * 6} commands per plan. Plan partial routes — you'll be called again as you progress.
-  • Avoid # cells. Prefer . over ? but cross ? if necessary.
+  • Avoid # cells. Prefer . over ? but cross ? if necessary. * is already painted and still passable.
 
 MULTI-STEP MISSIONS — STATE MACHINE PROTOCOL:
   Every call you MUST update these structured fields so the next-you can pick up coherently:
@@ -607,7 +609,7 @@ MULTI-STEP MISSIONS — STATE MACHINE PROTOCOL:
 
 Respond ONLY with valid JSON (no markdown):
 {{
-  "moves": ["F","R","F",...],
+  "moves": ["F","R","F","P",...],
   "reasoning": "what you're doing this turn and why",
   "phase": "1/2",
   "current_goal": "reach A",
@@ -624,7 +626,7 @@ Respond ONLY with valid JSON (no markdown):
         base += f"""
 
 ═══ TACTICAL EXECUTION MODE ═══
-You are NOT planning the whole mission. The server already decomposed it into phases and is tracking which one you're on. You only need to plan moves for THIS phase:
+You are NOT planning the whole mission. The server already decomposed it into phases and is tracking which one you're on. You only need to plan commands for THIS phase:
 
   Phase goal: {phase['goal']}
   End condition: rover must reach position (row {phase['end_when_pos'][0]}, col {phase['end_when_pos'][1]})
@@ -644,14 +646,14 @@ You can leave phase/current_goal/next_goal empty — server tracks those now."""
 This is NOT a fresh plan. You already drafted one for THIS SAME turn. Critique and improve it.
 
 Your previous draft:
-  moves: {rc['prev_plan']}
+  commands: {rc['prev_plan']}
   reasoning: {rc['prev_reasoning']}
   → if executed, the rover would end at row {sim_pos[0]}, col {sim_pos[1]}
 
 Critique it honestly:
   • Does it actually reach this turn's goal? (it ends at {sim_pos})
   • Does any step cross a # obstacle?
-  • Are there wasteful rotations or back-and-forth moves?
+  • Are there wasteful rotations or back-and-forth commands?
   • Does it respect the mission?
 
 Output an IMPROVED plan in the same JSON format. If the draft was already optimal, return it unchanged."""
@@ -846,7 +848,7 @@ def iterative_plan(state, iterations, tactical_phase=None):
         if iterations > 1:
             tag = "draft" if i == 0 else f"refine {i+1}/{iterations}"
             state["log"].append(
-                f"🔄 Plan {tag}: {len(result['moves'])} moves — {result['reasoning'][:90]}"
+                f"🔄 Plan {tag}: {len(result['moves'])} commands — {result['reasoning'][:90]}"
             )
     result["refine_history"] = history
     return result
@@ -884,10 +886,34 @@ def replans_in_window(state):
     return sum(1 for s in state["replan_steps"] if s >= threshold)
 
 
+def record_rover_command(state, cmd):
+    metrics = state.setdefault("metrics", {})
+    metrics["commands_sent"] = metrics.get("commands_sent", 0) + 1
+    counts = metrics.setdefault("command_counts", {})
+    counts[cmd] = counts.get(cmd, 0) + 1
+
+
+def paint_current_cell(state):
+    r, c = state["rover"]
+    painted = {
+        tuple(cell)
+        for cell in state.get("painted_cells", [])
+        if isinstance(cell, list) and len(cell) == 2
+    }
+    painted.add((r, c))
+    state["painted_cells"] = [list(cell) for cell in sorted(painted)]
+
+
 # ─── HTTP API ─────────────────────────────────────────────────────────────
 def client_state(state):
     m = state.get("metrics", {})
     rates = m.get("plan_completion_rates", [])
+    raw_command_counts = m.get("command_counts", {})
+    command_counts = {
+        cmd: int(raw_command_counts.get(cmd, 0))
+        for cmd in VALID_MOVES
+    }
+    commands_sent = int(m.get("commands_sent", sum(command_counts.values())))
 
     # Stale walls: cells the rover still believes are walls, but the world
     # has actually moved on (hidden obstacle drifted away unseen). God-view debug.
@@ -920,12 +946,15 @@ def client_state(state):
         "rotations": m.get("rotations", 0),
         "forwards": m.get("forwards", 0),
         "backwards": m.get("backwards", 0),
+        "paints": m.get("paints", 0),
+        "commands_sent": commands_sent,
+        "command_counts": command_counts,
     }
     return {
         "rover": state["rover"],
         "target": state["target"],
         "targets": state.get("targets", []),
-        "landmarks": [lm for lm in state.get("landmarks", []) if lm.get("discovered")],
+        "painted_cells": state.get("painted_cells", []),
         "mission_notes": state.get("mission_notes", ""),
         "plan_iterations": state.get("plan_iterations", 1),
         "strategy": state.get("strategy", []),
@@ -1119,6 +1148,7 @@ def start():
         mission=d.get("mission"),
         plan_iterations=d.get("plan_iterations", 1),
         targets=d.get("targets"),
+        painted_cells=d.get("painted_cells"),
     )
     game["log"].append(
         f"🚀 Mission start: {game['grid_size']}×{game['grid_size']}, sensor fwd={game['forward_range']}/back={BACK_RANGE}/side={SIDE_RANGE}, "
@@ -1238,7 +1268,7 @@ def plan():
                 source = "llm_rescued"
                 rescue_note = (
                     f"  ⚠ LLM plan stopped at {final_pos}; BFS extended to phase target {phase_goal_pos} "
-                    f"({len(rescued)} moves)."
+                    f"({len(rescued)} commands)."
                 )
                 game["metrics"]["bfs_calls"] += 1
                 r["moves"] = rescued
@@ -1253,7 +1283,7 @@ def plan():
         icon = "🧠" if source == "llm" else "🛟"
         game["log"].append(
             f"{icon} {source} from ({rover[0]},{rover[1]}) → ({target[0]},{target[1]}): "
-            f"{len(r['moves'])} moves [{preview}] — {r['reasoning']}{rescue_note}"
+            f"{len(r['moves'])} commands [{preview}] — {r['reasoning']}{rescue_note}"
         )
         game["log"].append(f"📋 Context shown to LLM (step {game['steps']}):\n{r['ascii_grid']}")
         return jsonify({**client_state(game), "source": source, "reasoning": r["reasoning"] + rescue_note})
@@ -1273,6 +1303,24 @@ def step():
     if not game["plan"]:
         return jsonify({"error": "no_plan"})
 
+    cmd = game["plan"].pop(0)
+    record_rover_command(game, cmd)
+    r, c = game["rover"]
+    gs = game["grid_size"]
+    heading = game["heading"]
+    step_n = game["steps"] + 1
+
+    # P is a paint-only command: no movement, rotation, sensor scan, obstacle tick, or phase completion.
+    if cmd == "P":
+        paint_current_cell(game)
+        game["steps"] += 1
+        game["metrics"]["paints"] = game["metrics"].get("paints", 0) + 1
+        game["metrics"]["last_plan_used"] += 1
+        game["log"].append(
+            f"🎨 step {step_n}: P painted ({r},{c}), heading={heading}, {len(game['plan'])} commands left"
+        )
+        return jsonify({**client_state(game), "event": "painted", "move": cmd})
+
     # 1. World ticks (obstacles may drift)
     mp_h = game.get("move_prob", 0.5)
     mp_f = game.get("move_prob_fixed", 0.0)
@@ -1282,12 +1330,7 @@ def step():
     # 2. Rover sensor reads fresh state BEFORE committing the move
     reveal_sensor(game, log_events=True)
 
-    cmd = game["plan"].pop(0)
-    r, c = game["rover"]
-    gs = game["grid_size"]
-    heading = game["heading"]
     new_heading, dr, dc = apply_command(heading, cmd)
-    step_n = game["steps"] + 1
 
     # Pure rotation (L or R) — no movement, just heading change
     if dr == 0 and dc == 0:
@@ -1296,7 +1339,7 @@ def step():
         game["metrics"]["rotations"] += 1
         game["metrics"]["last_plan_used"] += 1
         game["log"].append(
-            f"↻ step {step_n}: {cmd} (rotate) heading {heading} → {new_heading}, {len(game['plan'])} moves left"
+            f"↻ step {step_n}: {cmd} (rotate) heading {heading} → {new_heading}, {len(game['plan'])} commands left"
         )
         reveal_sensor(game, log_events=True)
         return jsonify({**client_state(game), "event": "moved", "move": cmd})
@@ -1349,7 +1392,7 @@ def step():
         game["metrics"]["backwards"] += 1
     label = "fwd" if cmd == "F" else "back"
     game["log"].append(
-        f"→ step {step_n}: {cmd} ({label}) → ({nr},{nc}), heading={new_heading}, {len(game['plan'])} moves left"
+        f"→ step {step_n}: {cmd} ({label}) → ({nr},{nc}), heading={new_heading}, {len(game['plan'])} commands left"
     )
 
     # 7. Scan from new position
@@ -1369,7 +1412,7 @@ def step():
         # Check if mission is done (all phases complete)
         if game.get("current_phase_idx", 0) >= len(game.get("strategy", [])):
             game["done"] = True
-            game["log"].append(f"🏁 ALL PHASES COMPLETE — {game['steps']} steps total")
+            game["log"].append(f"🏁 ALL PHASES COMPLETE — {game['steps']} commands total")
             return jsonify({**client_state(game), "event": "done"})
         # Otherwise: signal frontend to request new plan
         return jsonify({**client_state(game), "event": "phase_complete", "move": cmd})
@@ -1400,10 +1443,12 @@ def export_mission():
         "endpoints": {
             "start_pos": game.get("start_pos"),
             "target": game["target"],
+            "targets": game.get("targets", []),
             "final_rover": game["rover"],
             "final_heading": game["heading"],
         },
         "initial_grid": game.get("initial_grid"),
+        "painted_cells": game.get("painted_cells", []),
         "totals": {
             "steps": game["steps"],
             "recalculations": game["recalculations"],

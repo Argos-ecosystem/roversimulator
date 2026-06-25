@@ -14,7 +14,7 @@ The rover starts blind. Its sensor reveals nearby cells. It builds a mental map.
   - **Hidden / mobile** — random initial positions, drift to adjacent cells each tick at a configurable probability
 - **Sensor radius (1–4 cells)** — defines how far the rover sees
 - **Memory model** — rover only knows what it has scanned. Forgets cells re-scanned as empty (obstacles moved away).
-- **LLM planner (OpenAI)** — gets the ASCII map of rover's memory and returns a sequence of moves
+- **LLM planner (OpenAI)** — gets the ASCII map of rover's memory and returns a sequence of relative commands
 - **BFS fallback** — when the LLM produces 3+ failed plans within 8 steps, BFS computes a guaranteed-correct path through known walls
 - **Stuck mode** — when BFS finds no path either, LLM is re-prompted with explicit context about what to consider (exploring `?` cells, backtracking, accepting risk)
 - **Sensor-before-move** — the rover scans BEFORE committing a move, so it aborts gracefully when an obstacle appears in its path instead of crashing into it
@@ -88,7 +88,7 @@ The right panel shows every plan the rover has made. Click an entry to see the e
 ```
 1. Hidden obstacles move (world tick)
 2. Rover sensor scans surroundings → updates known_walls
-3. Pop next move from current plan
+3. Pop next command from current plan
 4. If destination is now in known_walls → smart abort, replan (no crash)
 5. If destination is wall outside prior sensor range → true crash, replan
 6. Otherwise move the rover and scan from new position
@@ -110,13 +110,63 @@ This prevents the rover from looping forever on bad LLM advice.
 
 ### LLM contract
 
-Prompt is a plain ASCII grid plus a small legend. The model must return JSON of the form:
+Each planning call sends the model the current mission context, the rover's known map, and the relative command contract. The model does not receive the full hidden world; it receives the rover's memory.
+
+The prompt includes:
+
+- The operator mission text.
+- The labeled reference points `A`, `B`, and `C`, with coordinates and visited/not-visited status.
+- The rover's current coordinate and heading:
+  `Rover at (row X, col Y), facing N/S/E/W`.
+- The rover's start coordinate, used as `origin` / `home` / `start` if the mission mentions it.
+- Recent decision history from the last few plans, so the model can continue multi-step missions.
+- The model's previous mission-state fields: `phase`, `current_goal`, `next_goal`, and `notes`.
+- An ASCII map of the rover's memory.
+- The sensor shape/range: configured cells ahead, `2` behind, and `1` to each side.
+- The list of legal commands and the required JSON response shape.
+
+The ASCII map is the main sensor/obstacle representation:
+
+| Symbol | Meaning |
+|---|---|
+| `R` | Rover current position |
+| `A/B/C` | Labeled reference points |
+| `#` | Known obstacle detected by sensor memory |
+| `.` | Confirmed clear cell |
+| `*` | Painted clear cell |
+| `?` | Unscanned / unknown cell |
+
+Sensor data is currently implicit in this ASCII map. For example, if the rover has scanned an obstacle, the model sees it as `#` at that coordinate. If a cell has not been scanned yet, the model sees `?`. The prompt does not currently include a separate list like `obstacles detected this turn: [(r,c)]`.
+
+Legal commands are relative to the rover's current heading:
+
+| Command | Meaning |
+|---|---|
+| `F` | Move 1 cell forward |
+| `B` | Move 1 cell backward without changing heading |
+| `L` | Rotate 90 degrees left in place |
+| `R` | Rotate 90 degrees right in place |
+| `P` | Paint the current cell only |
+
+`P` can also be returned as `PINTA`, `PINTAR`, or `PAINT`; the server normalizes those aliases to `P`. Painting is intentionally side-effect free: it does not move, rotate, scan, advance obstacles, or complete a phase.
+
+The model must return JSON of the form:
 
 ```json
-{"moves": ["N", "E", "E", "S", ...], "reasoning": "brief"}
+{
+  "moves": ["F", "R", "F", "P"],
+  "reasoning": "what the rover is doing this turn and why",
+  "phase": "1/2",
+  "current_goal": "reach A",
+  "next_goal": "return to origin",
+  "notes": "anything else worth remembering",
+  "done": false
+}
 ```
 
-Invalid moves (`"UP"`, strings instead of arrays, etc.) are filtered out. If the response has zero valid moves, one retry is attempted before giving up.
+Invalid commands (`"UP"`, unknown strings, non-arrays, etc.) are filtered out. If the response has zero valid commands and `done` is not true, one retry is attempted before giving up.
+
+When `plan_iterations` is greater than `1`, later passes also receive the previous draft plan and reasoning for the same turn, plus the simulated endpoint of that draft. The model is asked to critique and improve its own command sequence.
 
 ---
 
@@ -137,8 +187,8 @@ The backend keeps a single `game` dict in-memory — this is **single-tenant**. 
 | Endpoint | Verb | Purpose |
 |---|---|---|
 | `/api/start` | POST | Initialize a new mission with the provided grid + config |
-| `/api/plan`  | POST | Ask the planner (LLM or BFS) for the next sequence of moves |
-| `/api/step`  | POST | Execute the next move in the current plan; world advances one tick |
+| `/api/plan`  | POST | Ask the planner (LLM or BFS) for the next sequence of commands |
+| `/api/step`  | POST | Execute the next command in the current plan; world advances one tick |
 | `/api/export`| GET  | Dump full mission JSON (decisions, log, state) |
 
 ---
